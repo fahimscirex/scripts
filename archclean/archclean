@@ -730,7 +730,7 @@ category_title() {
         orphans)  echo "Orphaned packages" ;;
         crash)    echo "Crash reports" ;;
         logs)     echo "System logs" ;;
-        cache)    echo "App caches (allowlist)" ;;
+        cache)    echo "Cache (allowlist)" ;;
         trash)    echo "Trash" ;;
         claude)   echo "Claude Code versions" ;;
         agy)      echo "Old agy binaries" ;;
