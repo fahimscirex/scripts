@@ -1,0 +1,1454 @@
+#!/usr/bin/env bash
+# Ensure execution under bash even if invoked via `sh rank`
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
+# ==============================================================================
+# rank - Modern, map-aware pacman mirror ranking & management utility
+# ==============================================================================
+# Description:
+#   Automatically detects active Arch Linux and third-party repositories,
+#   benchmarks mirrors via rate-mirrors with live terminal feedback,
+#   safely performs atomic updates with timestamped backups, and provides
+#   restoration and database synchronization.
+#
+# License: GPL-3.0. See LICENSE.
+
+set -eo pipefail
+
+SCRIPT_VERSION="2.2.0"
+PACMAN_CONF="/etc/pacman.conf"
+PACMAN_D="/etc/pacman.d"
+BACKUP_DIR="${PACMAN_D}/backups"
+MAX_BACKUPS_PER_REPO=5
+
+# ------------------------------------------------------------------------------
+# UI & Styling Configuration (Catppuccin Mocha Theme)
+# ------------------------------------------------------------------------------
+# Check color support
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && [[ "${TERM:-}" != "dumb" ]]; then
+    USE_COLOR=true
+    C_RESET="\033[0m"
+    C_BOLD="\033[1m"
+    
+    # Catppuccin Mocha Palette
+    C_MAUVE="\033[38;2;203;166;247m"
+    C_RED="\033[38;2;243;139;168m"
+    C_PEACH="\033[38;2;250;179;135m"
+    C_GREEN="\033[38;2;166;227;161m"
+    C_TEAL="\033[38;2;148;226;213m"
+    C_SAPPHIRE="\033[38;2;116;199;236m"
+    C_LAVENDER="\033[38;2;180;190;254m"
+    C_TEXT="\033[38;2;205;214;244m"
+    C_SUBTEXT1="\033[38;2;186;194;222m"
+    C_SUBTEXT0="\033[38;2;166;173;200m"
+    C_OVERLAY1="\033[38;2;127;132;156m"
+    C_OVERLAY0="\033[38;2;108;112;134m"
+    C_SURFACE2="\033[38;2;88;91;112m"
+    C_SURFACE1="\033[38;2;69;71;90m"
+    BG_PEACH="\033[48;2;250;179;135m\033[38;2;17;17;27m"
+else
+    USE_COLOR=false
+    C_RESET=""; C_BOLD=""
+    C_MAUVE=""; C_RED=""; C_PEACH=""; C_GREEN=""
+    C_TEAL=""; C_SAPPHIRE=""; C_LAVENDER=""; C_TEXT=""
+    C_SUBTEXT1=""; C_SUBTEXT0=""; C_OVERLAY1=""; C_OVERLAY0=""
+    C_SURFACE2=""; C_SURFACE1=""; BG_PEACH=""
+fi
+
+disable_color() {
+    USE_COLOR=false
+    C_RESET=""; C_BOLD=""
+    C_MAUVE=""; C_RED=""; C_PEACH=""; C_GREEN=""
+    C_TEAL=""; C_SAPPHIRE=""; C_LAVENDER=""; C_TEXT=""
+    C_SUBTEXT1=""; C_SUBTEXT0=""; C_OVERLAY1=""; C_OVERLAY0=""
+    C_SURFACE2=""; C_SURFACE1=""; BG_PEACH=""
+}
+
+# Temporary workspace directory
+TMP_DIR=""
+init_tmpdir() {
+    TMP_DIR=$(mktemp -d -t rank.XXXXXX 2>/dev/null || mktemp -d /tmp/rank.XXXXXX)
+}
+cleanup_tmpfiles() {
+    [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR" 2>/dev/null || true
+}
+
+# Unicode vs ASCII glyphs
+# NOTE: log-line glyphs are deliberately chosen from single-cell codepoints
+# (• ▲ ✔ ✖). No pictographic or multi-width emojis are used.
+if [[ "${LANG:-}" =~ [Uu][Tt][Ff]-?8 ]]; then
+    SYM_CHECK="✔"
+    SYM_CROSS="✖"
+    SYM_WARN="▲"
+    SYM_INFO="•"
+    SYM_ARROW="›"
+    SYM_BULLET="•"
+
+    # Modern rounded box-drawing
+    BOX_TL="╭"
+    BOX_TR="╮"
+    BOX_BL="╰"
+    BOX_BR="╯"
+    BOX_H="─"
+    BOX_V="│"
+    BOX_TJ="┬"
+    BOX_BJ="┴"
+    BOX_LJ="├"
+    BOX_RJ="┤"
+    BOX_X="┼"
+else
+    SYM_CHECK="OK"
+    SYM_CROSS="XX"
+    SYM_WARN="!!"
+    SYM_INFO="--"
+    SYM_ARROW=">>"
+    SYM_BULLET="*"
+
+    # ASCII box-drawing
+    BOX_TL="+"
+    BOX_TR="+"
+    BOX_BL="+"
+    BOX_BR="+"
+    BOX_H="-"
+    BOX_V="|"
+    BOX_TJ="+"
+    BOX_BJ="+"
+    BOX_LJ="+"
+    BOX_RJ="+"
+    BOX_X="+"
+fi
+
+# Repeat a character N times (pure bash, high performance)
+repeat_char() {
+    local char="$1" count="$2"
+    (( count > 0 )) && printf "%0.s${char}" $(seq 1 "$count")
+}
+
+# Prominent Dry-Run Watermark Banner
+print_dry_run_watermark() {
+    if [[ "$FLAG_DRY_RUN" != true ]]; then
+        return 0
+    fi
+    echo ""
+    local badge=" DRY-RUN MODE "
+    local msg="Benchmark active only. No mirrorlists will be modified."
+    local inner=" ${badge} ${msg} "
+    local inner_len=${#inner}
+    local line_h
+    line_h=$(repeat_char "${BOX_H}" "$inner_len")
+
+    if [[ "$USE_COLOR" = true ]]; then
+        echo -e "  ${C_PEACH}${BOX_TL}${line_h}${BOX_TR}${C_RESET}"
+        echo -e "  ${C_PEACH}${BOX_V}${C_RESET} ${BG_PEACH}${badge}${C_RESET} ${C_BOLD}${C_PEACH}${msg}${C_RESET} ${C_PEACH}${BOX_V}${C_RESET}"
+        echo -e "  ${C_PEACH}${BOX_BL}${line_h}${BOX_BR}${C_RESET}"
+    else
+        local line_dash
+        line_dash=$(repeat_char "-" "$inner_len")
+        echo "  +${line_dash}+"
+        echo "  | [DRY-RUN MODE] ${msg} |"
+        echo "  +${line_dash}+"
+    fi
+}
+
+# Top Mirror Results Table
+print_mirror_card() {
+    local repo_id="$1"
+    local top_mirror="$2"
+    local top_speed="$3"
+    local valid_servers="$4"
+    local target_path="$5"
+    local backup_path="$6"
+    local duration="$7"
+    local is_dry="$8"
+
+    local col1_w=12
+    local col2_w=56
+
+    local h1; h1=$(repeat_char "${BOX_H}" $((col1_w + 2)))
+    local h2; h2=$(repeat_char "${BOX_H}" $((col2_w + 2)))
+
+    local title_repo="${repo_id}"
+    [[ "$is_dry" = true ]] && title_repo="${repo_id} [DRY-RUN]"
+
+    echo ""
+    echo -e "  ${C_SURFACE1}${BOX_TL}${h1}${BOX_TJ}${h2}${BOX_TR}${C_RESET}"
+    printf "  ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_LAVENDER}%-${col1_w}s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_MAUVE}%-${col2_w}s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET}\n" \
+        "TOP MIRROR" "$title_repo"
+    echo -e "  ${C_SURFACE1}${BOX_LJ}${h1}${BOX_X}${h2}${BOX_RJ}${C_RESET}"
+
+    # Status row
+    local stat_label="Ranked in ${duration}s (${valid_servers} mirrors configured)"
+    local check_vis=2; [[ "$SYM_CHECK" == "OK" ]] && check_vis=3
+    local stat_vis_len=$(( check_vis + ${#stat_label} ))
+    local stat_pad_len=$(( col2_w - stat_vis_len ))
+    local stat_pad=""
+    (( stat_pad_len > 0 )) && stat_pad=$(repeat_char " " "$stat_pad_len")
+    printf "  ${C_SURFACE1}${BOX_V}${C_RESET} ${C_TEXT}%-${col1_w}s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_GREEN}${SYM_CHECK}${C_RESET} ${C_TEXT}%s${C_RESET}%s ${C_SURFACE1}${BOX_V}${C_RESET}\n" \
+        "Status" "$stat_label" "$stat_pad"
+
+    # Fastest URL row
+    if [[ -n "$top_mirror" ]]; then
+        local u="$top_mirror"
+        if (( ${#u} > col2_w )); then
+            u="${u:0:$((col2_w - 3))}..."
+        fi
+        printf "  ${C_SURFACE1}${BOX_V}${C_RESET} ${C_TEXT}%-${col1_w}s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_TEAL}%-${col2_w}s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET}\n" \
+            "Fastest" "$u"
+    fi
+
+    # Speed row
+    if [[ -n "$top_speed" ]]; then
+        printf "  ${C_SURFACE1}${BOX_V}${C_RESET} ${C_TEXT}%-${col1_w}s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_GREEN}%-${col2_w}s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET}\n" \
+            "Speed" "$top_speed"
+    fi
+
+    # Output row
+    local dest_display="$target_path"
+    [[ "$is_dry" = true ]] && dest_display="${target_path} (dry-run: unchanged)"
+    if (( ${#dest_display} > col2_w )); then
+        dest_display="${dest_display:0:$((col2_w - 3))}..."
+    fi
+    local dest_color="${C_TEXT}"
+    [[ "$is_dry" = true ]] && dest_color="${C_PEACH}"
+    printf "  ${C_SURFACE1}${BOX_V}${C_RESET} ${C_TEXT}%-${col1_w}s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${dest_color}%-${col2_w}s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET}\n" \
+        "Output" "$dest_display"
+
+    # Backup row
+    if [[ -n "$backup_path" ]]; then
+        local bak_display="$backup_path"
+        if (( ${#bak_display} > col2_w )); then
+            bak_display="${bak_display:0:$((col2_w - 3))}..."
+        fi
+        printf "  ${C_SURFACE1}${BOX_V}${C_RESET} ${C_TEXT}%-${col1_w}s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_SUBTEXT0}%-${col2_w}s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET}\n" \
+            "Backup" "$bak_display"
+    fi
+
+    echo -e "  ${C_SURFACE1}${BOX_BL}${h1}${BOX_BJ}${h2}${BOX_BR}${C_RESET}"
+}
+
+# ------------------------------------------------------------------------------
+# Supported Repository Definitions
+# Format: repo_id:subcommand:mirrorlist_filename:default_max_mirrors:display_name
+# ------------------------------------------------------------------------------
+REPO_CATALOG=(
+    "arch:arch:mirrorlist:20:Arch Linux Official (core, extra, multilib)"
+    "chaotic-aur:chaotic-aur:chaotic-mirrorlist:10:Chaotic-AUR Prebuilt Repository"
+    "archlinuxcn:archlinuxcn:archlinuxcn-mirrorlist:10:Arch Linux Chinese Community Repo"
+    "endeavouros:endeavouros:endeavouros-mirrorlist:10:EndeavourOS Repository"
+    "cachyos:cachyos:cachyos-mirrorlist:10:CachyOS Optimized Repositories"
+    "blackarch:blackarch:blackarch-mirrorlist:10:BlackArch Security Repository"
+    "arch4edu:arch4edu:arch4edu-mirrorlist:10:Arch4Edu Academic Repository"
+    "artix:artix:artix-mirrorlist:10:Artix Linux Repositories"
+    "arcolinux:arcolinux:arcolinux-mirrorlist:10:ArcoLinux Repositories"
+    "manjaro:manjaro:mirrorlist:10:Manjaro Linux Repositories"
+)
+
+# Global configuration flags
+FLAG_ALL=false
+FLAG_DRY_RUN=false
+FLAG_FAST=false
+FLAG_YES=false
+FLAG_SYNC=default
+FLAG_NO_BACKUP=false
+FLAG_RESTORE=false
+FLAG_LIST=false
+OPT_COUNTRY=""
+OPT_MAX_MIRRORS=""
+OPT_COMPLETION=""
+TARGET_REPOS=()
+# Width of the repo-id column in progress lines; sized per-run in main()
+REPO_COL_WIDTH=4
+
+# Track results for the final summary table
+# Array of strings: "repo|status|file|count|top_speed|duration" (pipe-delimited: speed contains spaces/colons)
+declare -a RUN_RESULTS=()
+
+# ------------------------------------------------------------------------------
+# Logging & Printing Utilities
+# ------------------------------------------------------------------------------
+print_banner() {
+    local term_width
+    term_width=$(tput cols 2>/dev/null || echo 80)
+    [[ $term_width -gt 72 ]] && term_width=72
+
+    echo ""
+    if [[ "$USE_COLOR" = true ]]; then
+        echo -e "  ${C_BOLD}${C_MAUVE}::${C_RESET} ${C_BOLD}${C_LAVENDER}rank ${C_RESET}${C_SUBTEXT0}v${SCRIPT_VERSION}${C_RESET} ${C_OVERLAY1}— Map-Aware Pacman Mirror Optimizer${C_RESET}"
+        local rule_line
+        rule_line=$(repeat_char '─' "$((term_width - 4))")
+        echo -e "  ${C_SURFACE1}${rule_line}${C_RESET}"
+    else
+        echo "  :: rank v${SCRIPT_VERSION} - Map-Aware Pacman Mirror Optimizer"
+        echo "  ----------------------------------------------------------------"
+    fi
+}
+
+log_info() {
+    # %-2s keeps the message column fixed whether the glyph is 1 or 2 cells wide.
+    # %b (not %s) for the message: callers embed ${C_*} codes which must be
+    # interpreted, matching the old echo -e behavior.
+    printf '  %b%-2s%b %b%b%b\n' "${C_SAPPHIRE}" "${SYM_INFO}" "${C_RESET}" "${C_TEXT}" "$*" "${C_RESET}"
+}
+
+log_success() {
+    printf '  %b%-2s%b %b%b%b\n' "${C_GREEN}" "${SYM_CHECK}" "${C_RESET}" "${C_TEXT}" "$*" "${C_RESET}"
+}
+
+log_warn() {
+    printf '  %b%-2s%b %b%b%b\n' "${C_PEACH}" "${SYM_WARN}" "${C_RESET}" "${C_PEACH}" "$*" "${C_RESET}" >&2
+}
+
+log_error() {
+    printf '  %b%-2s%b %b%b%b\n' "${C_RED}" "${SYM_CROSS}" "${C_RESET}" "${C_RED}" "$*" "${C_RESET}" >&2
+}
+
+log_step() {
+    echo -e "\n  ${C_BOLD}${C_MAUVE}::${C_RESET} ${C_BOLD}${C_LAVENDER}$*${C_RESET}"
+}
+
+# ------------------------------------------------------------------------------
+# Help & Version Display
+# ------------------------------------------------------------------------------
+show_help() {
+    print_banner
+    cat <<EOF
+
+USAGE:
+    rank [OPTIONS] [REPOSITORIES...]
+
+DESCRIPTION:
+    Benchmarks and ranks Arch Linux and third-party pacman mirrors using
+    rate-mirrors. Auto-detects configured repositories, verifies outputs,
+    creates timestamped backups, and safely applies atomic updates.
+
+REPOSITORIES:
+    arch            Arch Linux official repos (core, extra, multilib)
+    chaotic-aur     Chaotic-AUR prebuilt packages
+    archlinuxcn     Arch Linux Chinese Community repository
+    endeavouros     EndeavourOS repository
+    cachyos         CachyOS optimized repositories
+    blackarch       BlackArch penetration testing repository
+    arch4edu        Arch4Edu academic packages repository
+    artix           Artix Linux repositories (system, world, galaxy)
+    arcolinux       ArcoLinux repositories
+    manjaro         Manjaro Linux repositories
+    (or omit to automatically detect active repositories)
+
+OPTIONS:
+    -a, --all                 Benchmark all detected active repositories
+    -l, --list                List detected repositories and system status, then exit
+    -d, --dry-run             Run mirror ranking without writing to /etc/pacman.d/
+    -c, --country <code>      Entry country ISO code (e.g. US, DE, SG, BD)
+    -m, --max-mirrors <num>   Override maximum mirrors to save in mirrorlist (1-100)
+    -f, --fast                Fast mode (higher concurrency, lower timeout)
+    -s, --sync                Synchronize pacman databases (pacman -Syy) after ranking
+        --no-sync             Do not prompt or synchronize pacman databases
+        --restore             Restore mirrorlists from previous backups
+        --no-backup           Do not create backups before updating
+        --no-color            Disable ANSI color outputs
+        --completion <num>    Completion threshold for arch ranking (0-1 float)
+    -y, --yes                 Automatic yes to prompts; run non-interactively
+    -h, --help                Show this help message
+    -v, --version             Show version information
+
+EXAMPLES:
+    rank                      # Auto-detect and rank all active repositories
+    rank arch chaotic-aur     # Rank only official Arch and Chaotic-AUR
+    rank --dry-run arch       # Test ranking Arch mirrors without saving
+    rank -f -c DE             # Fast benchmark starting from Germany
+    rank --restore            # Restore mirrorlist from backup
+
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Repository Detection Engine
+# ------------------------------------------------------------------------------
+# Returns space-separated list of detected repo IDs
+detect_active_repositories() {
+    local detected=()
+    local pacman_content=""
+    local distro_id=""
+    distro_id=$(grep -E "^ID=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo "arch")
+    
+    # Read pacman.conf and any include drop-ins
+    if [[ -f "$PACMAN_CONF" ]]; then
+        pacman_content=$(cat "$PACMAN_CONF" 2>/dev/null || true)
+        if [[ -d "/etc/pacman.conf.d" ]]; then
+            pacman_content+=$'\n'$(cat /etc/pacman.conf.d/*.conf 2>/dev/null || true)
+        fi
+    fi
+
+    for entry in "${REPO_CATALOG[@]}"; do
+        IFS=':' read -r repo_id subcommand filename default_max desc <<< "$entry"
+        local is_active=false
+
+        case "$repo_id" in
+            arch)
+                # Arch official repos (core, extra, multilib)
+                if [[ "$distro_id" != "manjaro" && "$distro_id" != "artix" ]]; then
+                    if echo "$pacman_content" | grep -qE "^\s*\[(core|extra|multilib)\]" || [[ -f "${PACMAN_D}/${filename}" ]]; then
+                        is_active=true
+                    fi
+                fi
+                ;;
+            manjaro)
+                if [[ "$distro_id" == "manjaro" ]] || [[ -f "/etc/manjaro-release" ]]; then
+                    is_active=true
+                fi
+                ;;
+            artix)
+                if [[ "$distro_id" == "artix" ]] || echo "$pacman_content" | grep -qE "^\s*\[(system|world|galaxy)\]"; then
+                    is_active=true
+                fi
+                ;;
+            chaotic-aur)
+                if echo "$pacman_content" | grep -qE "^\s*\[chaotic-aur\]" || [[ -f "${PACMAN_D}/${filename}" ]]; then
+                    is_active=true
+                fi
+                ;;
+            archlinuxcn)
+                if echo "$pacman_content" | grep -qE "^\s*\[archlinuxcn\]" || [[ -f "${PACMAN_D}/${filename}" ]]; then
+                    is_active=true
+                fi
+                ;;
+            endeavouros)
+                if echo "$pacman_content" | grep -qE "^\s*\[endeavouros\]" || [[ -f "${PACMAN_D}/${filename}" ]]; then
+                    is_active=true
+                fi
+                ;;
+            cachyos)
+                if echo "$pacman_content" | grep -qE "^\s*\[cachyos" || [[ -f "${PACMAN_D}/${filename}" ]]; then
+                    is_active=true
+                fi
+                ;;
+            blackarch)
+                if echo "$pacman_content" | grep -qE "^\s*\[blackarch\]" || [[ -f "${PACMAN_D}/${filename}" ]]; then
+                    is_active=true
+                fi
+                ;;
+            arch4edu)
+                if echo "$pacman_content" | grep -qE "^\s*\[arch4edu\]" || [[ -f "${PACMAN_D}/${filename}" ]]; then
+                    is_active=true
+                fi
+                ;;
+            arcolinux)
+                if echo "$pacman_content" | grep -qE "^\s*\[arcolinux" || [[ -f "${PACMAN_D}/${filename}" ]]; then
+                    is_active=true
+                fi
+                ;;
+        esac
+
+        if [[ "$is_active" = true ]]; then
+            detected+=("$repo_id")
+        fi
+    done
+
+    echo "${detected[@]}"
+}
+
+# ------------------------------------------------------------------------------
+# List Command
+# ------------------------------------------------------------------------------
+list_repositories() {
+    print_banner
+    log_step "Repository Discovery Status"
+    
+    local detected_str
+    detected_str=$(detect_active_repositories)
+    read -r -a detected_list <<< "$detected_str" || true
+
+    echo ""
+    printf "  ${C_BOLD}${C_LAVENDER}%-14s %-40s %-12s %s${C_RESET}\n" "REPOSITORY" "MIRRORLIST PATH" "STATUS" "DESCRIPTION"
+    printf "  ${C_SURFACE1}%-14s %-40s %-12s %s${C_RESET}\n" "──────────────" "────────────────────────────────────────" "────────────" "───────────"
+
+    for entry in "${REPO_CATALOG[@]}"; do
+        IFS=':' read -r repo_id subcommand filename default_max desc <<< "$entry"
+        local is_detected=false
+
+        for d in "${detected_list[@]}"; do
+            if [[ "$d" == "$repo_id" ]]; then
+                is_detected=true
+                break
+            fi
+        done
+
+        local file_status="${PACMAN_D}/${filename}"
+
+        if [[ "$is_detected" = true ]]; then
+            printf "  ${C_TEXT}%-14s${C_RESET} ${C_SUBTEXT1}%-40s${C_RESET} ${C_GREEN}%s %-10s${C_RESET} ${C_SUBTEXT0}%s${C_RESET}\n" "$repo_id" "$file_status" "$SYM_CHECK" "Active" "$desc"
+        else
+            printf "  ${C_OVERLAY1}%-14s${C_RESET} ${C_OVERLAY0}%-40s${C_RESET} ${C_OVERLAY0}%s %-10s${C_RESET} ${C_SURFACE2}%s${C_RESET}\n" "$repo_id" "$file_status" "$SYM_BULLET" "Inactive" "$desc"
+        fi
+    done
+    echo ""
+}
+
+# ------------------------------------------------------------------------------
+# Privilege Check and Auto-Elevation
+# ------------------------------------------------------------------------------
+ensure_privileges() {
+    if [[ "$FLAG_DRY_RUN" = true ]]; then
+        return 0
+    fi
+
+    if [[ $EUID -ne 0 ]]; then
+        if command -v sudo >/dev/null 2>&1; then
+            if ! sudo -n true 2>/dev/null; then
+                log_info "Elevated privileges required to update pacman mirrorlists."
+            fi
+            local script_path
+            script_path="$(realpath "$0" 2>/dev/null || echo "$0")"
+            exec sudo -- bash "$script_path" "$@"
+        else
+            log_error "This script must be run as root or with sudo installed."
+            exit 1
+        fi
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Backup Management & Restoration
+# ------------------------------------------------------------------------------
+create_backup() {
+    local target_file="$1"
+    local repo_id="$2"
+
+    if [[ "$FLAG_NO_BACKUP" = true ]] || [[ ! -f "$target_file" ]]; then
+        return 0
+    fi
+
+    mkdir -p "$BACKUP_DIR"
+    chmod 755 "$BACKUP_DIR"
+
+    local timestamp
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    local filename
+    filename=$(basename "$target_file")
+    local backup_target="${BACKUP_DIR}/${filename}.${timestamp}.bak"
+    local standard_bak="${target_file}.bak"
+
+    # Copy to timestamped backup
+    cp -p "$target_file" "$backup_target"
+    # Copy to standard .bak file for backwards compatibility
+    cp -p "$target_file" "$standard_bak"
+
+    # Rotate old timestamped backups (keep MAX_BACKUPS_PER_REPO)
+    # Null-delimited, mtime-sorted (safe for spaces/newlines; no ls parsing)
+    local keep=$((MAX_BACKUPS_PER_REPO))
+    local count=0
+    while IFS= read -r -d '' old; do
+        count=$((count + 1))
+        if (( count > keep )); then
+            rm -f "$old"
+        fi
+    done < <(find "$BACKUP_DIR" -maxdepth 1 -name "${filename}.*.bak" -type f -printf '%T@ %p\0' 2>/dev/null | sort -z -rn | cut -z -d' ' -f2- || true)
+
+    echo "$backup_target"
+}
+
+restore_backups_menu() {
+    print_banner
+    log_step "Mirrorlist Restoration"
+
+    if [[ ! -d "$BACKUP_DIR" ]] && ! compgen -G "${PACMAN_D}/*.bak" >/dev/null; then
+        log_warn "No mirrorlist backups found in ${BACKUP_DIR} or ${PACMAN_D}."
+        exit 0
+    fi
+
+    local backups=()
+    # mtime-sorted, null-delimited (safe for spaces/newlines)
+    while IFS= read -r -d '' file; do
+        backups+=("$file")
+    done < <(find "$BACKUP_DIR" "${PACMAN_D}" -maxdepth 1 -name "*mirrorlist*.bak*" -type f -printf '%T@ %p\0' 2>/dev/null | sort -z -rn | cut -z -d' ' -f2- || true)
+
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        log_warn "No backups found."
+        exit 0
+    fi
+
+    echo ""
+    log_info "Found ${#backups[@]} available backup(s):"
+    echo ""
+
+    local h_idx; h_idx=$(repeat_char "${BOX_H}" 4)
+    local h_repo; h_repo=$(repeat_char "${BOX_H}" 13)
+    local h_file; h_file=$(repeat_char "${BOX_H}" 27)
+    local h_date; h_date=$(repeat_char "${BOX_H}" 18)
+    local h_size; h_size=$(repeat_char "${BOX_H}" 8)
+
+    echo -e "  ${C_SURFACE1}${BOX_TL}${h_idx}${BOX_TJ}${h_repo}${BOX_TJ}${h_file}${BOX_TJ}${h_date}${BOX_TJ}${h_size}${BOX_TR}${C_RESET}"
+    printf "  ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_LAVENDER}%-2s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_LAVENDER}%-11s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_LAVENDER}%-25s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_LAVENDER}%-16s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_LAVENDER}%-6s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET}\n" "#" "REPO" "BACKUP FILE" "DATE CREATED" "SIZE"
+    echo -e "  ${C_SURFACE1}${BOX_LJ}${h_idx}${BOX_X}${h_repo}${BOX_X}${h_file}${BOX_X}${h_date}${BOX_X}${h_size}${BOX_RJ}${C_RESET}"
+
+    local i=1
+    for b in "${backups[@]}"; do
+        local mtime
+        mtime=$(stat -c '%y' "$b" 2>/dev/null | cut -d'.' -f1 || echo "unknown")
+        local mtime_short="${mtime:0:16}"
+        local size_bytes
+        size_bytes=$(stat -c '%s' "$b" 2>/dev/null || echo "0")
+        local size_fmt
+        if (( size_bytes >= 1024 )); then
+            size_fmt="$(( size_bytes / 1024 )) KB"
+        else
+            size_fmt="${size_bytes} B"
+        fi
+
+        local bname
+        bname=$(basename "$b")
+        local r_name="arch"
+        for entry in "${REPO_CATALOG[@]}"; do
+            IFS=':' read -r cat_id _sub cfile _max _desc <<< "$entry"
+            if [[ "$bname" =~ ^${cfile} ]]; then
+                r_name="$cat_id"
+                break
+            fi
+        done
+
+        local short_bname="$bname"
+        if (( ${#short_bname} > 25 )); then
+            short_bname="${short_bname:0:22}..."
+        fi
+
+        printf "  ${C_SURFACE1}${BOX_V}${C_RESET} ${C_MAUVE}%2d${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_TEXT}%-11s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_SUBTEXT1}%-25s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_OVERLAY0}%-16s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_TEAL}%6s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET}\n" \
+            "$i" "$r_name" "$short_bname" "$mtime_short" "$size_fmt"
+        i=$((i + 1))
+    done
+
+    echo -e "  ${C_SURFACE1}${BOX_BL}${h_idx}${BOX_BJ}${h_repo}${BOX_BJ}${h_file}${BOX_BJ}${h_date}${BOX_BJ}${h_size}${BOX_BR}${C_RESET}"
+
+    echo ""
+    local choice
+    read -rp " Select backup number to restore (or 'q' to quit): " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#backups[@]} )); then
+        local selected="${backups[$((choice - 1))]}"
+        local filename
+        filename=$(basename "$selected")
+
+        # Validate backup looks like a mirrorlist before overwriting live file
+        if ! grep -qE '^\s*Server\s*=' "$selected" 2>/dev/null; then
+            log_error "Backup '${selected}' contains no 'Server =' lines — refusing to restore."
+            exit 1
+        fi
+        
+        # Determine target file
+        local target_base="${filename%%.bak*}"
+        local target="${PACMAN_D}/${target_base}"
+
+        cp -p "$selected" "$target"
+        chmod 644 "$target"
+        chown root:root "$target" 2>/dev/null || true
+        log_success "Restored ${selected} -> ${target}"
+    else
+        log_info "Restoration aborted."
+    fi
+    exit 0
+}
+
+# ------------------------------------------------------------------------------
+# Interactive / Spinner Execution Helper
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Interactive / Progress Bar Execution Helper
+# ------------------------------------------------------------------------------
+render_progress_bar() {
+    local percent="$1"
+    local width="${2:-18}"
+    
+    local filled_chars=$(( (percent * width) / 100 ))
+    if (( filled_chars > width )); then filled_chars=$width; fi
+    if (( filled_chars < 0 )); then filled_chars=0; fi
+    local empty_chars=$(( width - filled_chars ))
+
+    local bar=""
+    if [[ "$USE_COLOR" = true ]]; then
+        local f_str=""
+        for ((j = 0; j < filled_chars; j++)); do f_str+="█"; done
+        local e_str=""
+        for ((j = 0; j < empty_chars; j++)); do e_str+="░"; done
+        bar="[${C_MAUVE}${f_str}${C_RESET}${C_SURFACE1}${e_str}${C_RESET}]"
+    else
+        local f_str=""
+        for ((j = 0; j < filled_chars; j++)); do f_str+="#"; done
+        local e_str=""
+        for ((j = 0; j < empty_chars; j++)); do e_str+="-"; done
+        bar="[${f_str}${e_str}]"
+    fi
+    echo -ne "$bar"
+}
+
+# Runs rate-mirrors in background, tracks duration and parsed status
+run_rate_mirrors_live() {
+    local repo_id="$1"
+    local repo_idx="$2"
+    local total_repos="$3"
+    local max_jumps="$4"
+    local logfile="$5"
+    shift 5
+    local cmd=("$@")
+
+    # Start rate-mirrors in the background
+    "${cmd[@]}" > "$logfile" 2>&1 &
+    local pid=$!
+
+    local spinner_frames=("⣾" "⣽" "⣻" "⢿" "⡿" "⣟" "⣯" "⣷")
+    local spin_color="$C_MAUVE"
+    # ASCII fallback: Braille misrenders (double-width/placeholder) without UTF-8
+    if ! [[ "${LANG:-}" =~ [Uu][Tt][Ff]-?8 ]]; then
+        spinner_frames=("-" "\\" "|" "/")
+    fi
+    local frame_idx=0
+    local start_time
+    start_time=$(date +%s)
+    local last_logged_time=0
+
+    local regex_speed="SpeedTestResult \{ speed: ([^;]+);"
+    local regex_country="\[([A-Z]{2})\]"
+    local regex_exploring="EXPLORING ([A-Z]{2})"
+
+    # Hide cursor on interactive terminals
+    if [[ -t 1 ]]; then
+        tput civis 2>/dev/null || true
+    fi
+
+    local current_stage="Fetching"
+    local current_detail="Initializing..."
+    local last_speed=""
+    local last_country=""
+    local current_jump=0
+    local progress_pct=5
+    local tested_count=0
+    # Cache terminal width once (avoid tput fork every tick)
+    local term_width
+    term_width=$(tput cols 2>/dev/null || echo 80)
+    local bar_width=16
+    if (( term_width < 80 )); then bar_width=10; fi
+    local num_frames=${#spinner_frames[@]}
+    # Non-interactive: emit a start line so short runs aren't silent
+    if [[ ! -t 1 ]]; then
+        printf " [%-*s %d/%d] starting benchmark (%s)...\n" "$REPO_COL_WIDTH" "$repo_id" "$repo_idx" "$total_repos" "$current_stage"
+        last_logged_time=$(date +%s)
+    fi
+
+    while kill -0 "$pid" 2>/dev/null; do
+        local now
+        now=$(date +%s)
+        local elapsed=$(( now - start_time ))
+
+        if [[ -f "$logfile" ]]; then
+            if grep -qE "(FINISHED AT:|==== RESULTS)" "$logfile" 2>/dev/null; then
+                progress_pct=100
+                current_stage="Finalizing"
+                current_detail="Saving mirrors..."
+            elif grep -q "RE-TESTING TOP MIRRORS" "$logfile" 2>/dev/null; then
+                progress_pct=90
+                current_stage="Retesting"
+                local recent_speed
+                recent_speed=$(tail -n 6 "$logfile" 2>/dev/null | grep -oE "SpeedTestResult \{ speed: [^;]+" | tail -n 1 | awk '{print $4, $5}' || true)
+                if [[ -n "$recent_speed" ]]; then
+                    current_detail="Top 5 (${recent_speed})"
+                else
+                    current_detail="Top 5 candidates"
+                fi
+            else
+                local j_match
+                j_match=$(grep -oE "JUMP #[0-9]+" "$logfile" 2>/dev/null | tail -n 1 | tr -dc '0-9' || true)
+                if [[ -n "$j_match" ]] && (( j_match >= 1 )); then
+                    current_jump="$j_match"
+                    current_stage="Jump ${current_jump}/${max_jumps}"
+                    local base_pct=$(( 10 + ((current_jump - 1) * 75) / max_jumps ))
+                    tested_count=$(grep -E "(SpeedTestResult|FAILED TO CONNECT|TOO FEW BYTES)" "$logfile" 2>/dev/null | wc -l || true)
+                    tested_count=$(echo "$tested_count" | tr -d '[:space:]')
+                    [[ "$tested_count" =~ ^[0-9]+$ ]] || tested_count=0
+                    local bump=$(( (tested_count % 6) * 2 ))
+                    progress_pct=$(( base_pct + bump ))
+                    if (( progress_pct > 86 )); then progress_pct=86; fi
+                elif grep -q "MIRRORS LEFT AFTER FILTERING" "$logfile" 2>/dev/null; then
+                    progress_pct=10
+                    current_stage="Filtering"
+                    current_detail="Ready to test"
+                elif grep -q "FETCHED MIRRORS" "$logfile" 2>/dev/null; then
+                    progress_pct=7
+                    current_stage="Fetched"
+                    current_detail="Processing list"
+                fi
+
+                local last_line
+                last_line=$(tail -n 8 "$logfile" 2>/dev/null || true)
+                if [[ "$last_line" =~ $regex_speed ]]; then
+                    last_speed="${BASH_REMATCH[1]}"
+                    last_country=""
+                    if [[ "$last_line" =~ $regex_country ]]; then
+                        last_country="[${BASH_REMATCH[1]}] "
+                    fi
+                    current_detail="${last_country}${last_speed}"
+                elif [[ "$last_line" =~ $regex_exploring ]]; then
+                    current_detail="Exploring ${BASH_REMATCH[1]}"
+                fi
+            fi
+        fi
+
+        if [[ -t 1 ]] && [[ "$USE_COLOR" = true ]]; then
+            local frame="${spinner_frames[$frame_idx]}"
+
+            local pbar
+            pbar=$(render_progress_bar "$progress_pct" "$bar_width")
+
+            # Fixed-width columns so nothing shifts mid-run
+            local detail_short="$current_detail"
+            if (( ${#detail_short} > 22 )); then
+                detail_short="${detail_short:0:19}..."
+            fi
+
+            local sep="${C_OVERLAY0}·${C_RESET}"
+            printf "\r  ${spin_color}%s${C_RESET} %b ${C_BOLD}${C_TEXT}%3d%%${C_RESET}  %b  ${C_SUBTEXT1}%3ds${C_RESET}  %b  ${C_SAPPHIRE}%-10s${C_RESET}  %b  ${C_TEAL}%-22s${C_RESET}\033[K" \
+                "$frame" "$pbar" "$progress_pct" "$sep" "$elapsed" "$sep" "$current_stage" "$sep" "$detail_short"
+
+            frame_idx=$(( (frame_idx + 1) % num_frames ))
+        else
+            # Non-interactive / piped fallback: periodic update
+            if (( now - last_logged_time >= 8 )); then
+                printf "  [%s %d/%d] %3d%% · %s · %2ds · %s\n" \
+                    "$repo_id" "$repo_idx" "$total_repos" "$progress_pct" "$current_stage" "$elapsed" "$current_detail"
+                last_logged_time="$now"
+            fi
+        fi
+
+        sleep 0.25
+    done
+
+    # Wait for rate-mirrors to collect exit code
+    local exit_code=0
+    wait "$pid" || exit_code=$?
+
+    # Finalize progress bar display line and restore cursor
+    if [[ -t 1 ]]; then
+        if [[ $exit_code -eq 0 ]] && [[ "$USE_COLOR" = true ]]; then
+            local full_bar
+            full_bar=$(render_progress_bar 100 "$bar_width")
+            local total_elapsed=$(( $(date +%s) - start_time ))
+            local status_text="Completed"
+            [[ "$FLAG_DRY_RUN" = true ]] && status_text="Completed (dry-run)"
+            local sep="${C_OVERLAY0}·${C_RESET}"
+            printf "\r  ${C_GREEN}${SYM_CHECK}${C_RESET} %b ${C_BOLD}${C_GREEN}100%%${C_RESET}  %b  ${C_SUBTEXT1}%3ds${C_RESET}  %b  ${C_GREEN}%s${C_RESET}\033[K\n" \
+                "$full_bar" "$sep" "$total_elapsed" "$sep" "$status_text"
+        else
+            printf "\r\033[K"
+        fi
+        tput cnorm 2>/dev/null || true
+    else
+        local total_elapsed=$(( $(date +%s) - start_time ))
+        if [[ $exit_code -eq 0 ]]; then
+            printf "  [OK] %s done in %ds (exit 0)\n" "$repo_id" "$total_elapsed"
+        else
+            printf "  [XX] %s failed in %ds (exit %d)\n" "$repo_id" "$total_elapsed" "$exit_code"
+        fi
+    fi
+
+    return "$exit_code"
+}
+
+# ------------------------------------------------------------------------------
+# Core Benchmarking Handler
+# ------------------------------------------------------------------------------
+benchmark_repo() {
+    local repo_id="$1"
+    local subcommand="$2"
+    local filename="$3"
+    local max_mirrors="$4"
+    local display_name="$5"
+    local repo_idx="${6:-1}"
+    local total_repos="${7:-1}"
+
+    local target_path="${PACMAN_D}/${filename}"
+    local tmp_output="${TMP_DIR}/rate-mirrors-${repo_id}.tmp"
+    local start_ts
+    start_ts=$(date +%s)
+
+    echo ""
+    if [[ "$USE_COLOR" = true ]]; then
+        echo -e "  ${C_BOLD}${C_MAUVE}::${C_RESET} ${C_PEACH}[${repo_idx}/${total_repos}]${C_RESET} ${C_BOLD}${C_LAVENDER}${repo_id}${C_RESET} ${C_SUBTEXT0}— ${display_name}${C_RESET}"
+        echo -e "     ${C_OVERLAY1}File:${C_RESET} ${C_TEXT}${target_path}${C_RESET}\n"
+    else
+        echo "  :: [${repo_idx}/${total_repos}] ${repo_id} - ${display_name}"
+        echo "     File: ${target_path}"
+        echo ""
+    fi
+
+    # Build rate-mirrors argument array
+    local rm_args=()
+
+    # Global options (probe --allow-root for older rate-mirrors releases)
+    if rate-mirrors --help 2>/dev/null | grep -q -- "--allow-root"; then
+        rm_args+=("--allow-root")
+    elif [[ $EUID -eq 0 ]]; then
+        log_warn "'rate-mirrors' lacks --allow-root; running as root may fail. Consider upgrading rate-mirrors."
+    fi
+    rm_args+=("--save=${tmp_output}")
+    
+    # Mirror count limit
+    local actual_max="${OPT_MAX_MIRRORS:-$max_mirrors}"
+    if [[ -n "$actual_max" ]]; then
+        rm_args+=("--max-mirrors-to-output=${actual_max}")
+    fi
+
+    # Entry Country
+    if [[ -n "$OPT_COUNTRY" ]]; then
+        rm_args+=("--entry-country=${OPT_COUNTRY}")
+    fi
+
+    # Fast mode tuning
+    local max_jumps=7
+    if [[ "$FLAG_FAST" = true ]]; then
+        rm_args+=("--concurrency=32")
+        rm_args+=("--per-mirror-timeout=4000")
+        rm_args+=("--max-jumps=4")
+        max_jumps=4
+    fi
+
+    # Subcommand
+    rm_args+=("$subcommand")
+
+    # Subcommand specific options
+    if [[ "$subcommand" == "arch" ]]; then
+        local completion="${OPT_COMPLETION:-1}"
+        rm_args+=("--completion=${completion}")
+    fi
+
+    # Execute rate-mirrors with live UI and progress bar directly on terminal stdout
+    local logfile="${TMP_DIR}/rank-log-${repo_id}.tmp"
+    local exit_status=0
+    run_rate_mirrors_live "$repo_id" "$repo_idx" "$total_repos" "$max_jumps" "$logfile" rate-mirrors "${rm_args[@]}" || exit_status=$?
+
+    local end_ts
+    end_ts=$(date +%s)
+    local duration=$(( end_ts - start_ts ))
+
+    local rm_output=""
+    if [[ -f "$logfile" ]]; then
+        rm_output=$(cat "$logfile")
+        rm -f "$logfile"
+    fi
+
+    # Verification: Validate rate-mirrors output
+    local valid_servers=0
+    if [[ -s "$tmp_output" ]]; then
+        valid_servers=$(grep -E '^\s*Server\s*=' "$tmp_output" 2>/dev/null | wc -l || true)
+        # wc adds whitespace; strip to a plain integer
+        valid_servers=$(echo "$valid_servers" | tr -d '[:space:]')
+        [[ "$valid_servers" =~ ^[0-9]+$ ]] || valid_servers=0
+    fi
+
+    if [[ $exit_status -ne 0 ]] || [[ $valid_servers -eq 0 ]]; then
+        log_error "Ranking failed for '${repo_id}' (exit: ${exit_status}, valid servers: ${valid_servers})."
+        if [[ -f "$target_path" ]]; then
+            log_warn "Existing mirrorlist untouched: ${target_path}"
+        fi
+        rm -f "$tmp_output"
+        RUN_RESULTS+=("${repo_id}|FAILED|${target_path}|0|None|${duration}s")
+        return 1
+    fi
+
+    # -m1 stops after the first match: no head, so no SIGPIPE under pipefail
+    local top_mirror=""
+    local top_speed=""
+    top_mirror=$(grep -m1 -E '^\s*Server\s*=' "$tmp_output" 2>/dev/null | awk '{print $3}' 2>/dev/null || echo "")
+    
+    # Try parsing top speed from rate-mirrors log output
+    local pattern_top='1\.\ (\[[A-Z]{2}\]\ )?SpeedTestResult \{ speed: ([^;]+);'
+    local pattern_any='SpeedTestResult \{ speed: ([^;]+);'
+    if [[ "$rm_output" =~ $pattern_top ]]; then
+        top_speed="${BASH_REMATCH[2]}"
+    elif [[ "$rm_output" =~ $pattern_any ]]; then
+        top_speed="${BASH_REMATCH[1]}"
+    fi
+
+    # Handle Dry-Run mode
+    if [[ "$FLAG_DRY_RUN" = true ]]; then
+        print_mirror_card "$repo_id" "$top_mirror" "$top_speed" "$valid_servers" "$target_path" "" "$duration" true
+        rm -f "$tmp_output"
+        RUN_RESULTS+=("${repo_id}|DRY-RUN|${target_path}|${valid_servers}|${top_speed:-OK}|${duration}s")
+        return 0
+    fi
+
+    # Backup previous mirrorlist
+    local backup_path=""
+    if [[ -f "$target_path" ]]; then
+        backup_path=$(create_backup "$target_path" "$repo_id")
+    fi
+
+    # Atomically install new mirrorlist
+    mkdir -p "$(dirname "$target_path")"
+    install -m 644 -o root -g root "$tmp_output" "$target_path"
+    # Post-install verification (catch truncated/failed installs)
+    local installed=0
+    installed=$(grep -E '^\s*Server\s*=' "$target_path" 2>/dev/null | wc -l || true)
+    installed=$(echo "$installed" | tr -d '[:space:]')
+    [[ "$installed" =~ ^[0-9]+$ ]] || installed=0
+    if [[ "$installed" -eq 0 ]]; then
+        log_error "Installed mirrorlist verification failed: ${target_path}"
+        if [[ -n "$backup_path" ]] && [[ -f "$backup_path" ]]; then
+            log_warn "Attempting to restore backup..."
+            cp -p "$backup_path" "$target_path" || true
+        fi
+        rm -f "$tmp_output"
+        RUN_RESULTS+=("${repo_id}|FAILED|${target_path}|0|None|${duration}s")
+        return 1
+    fi
+    rm -f "$tmp_output"
+
+    print_mirror_card "$repo_id" "$top_mirror" "$top_speed" "$valid_servers" "$target_path" "$backup_path" "$duration" false
+
+    RUN_RESULTS+=("${repo_id}|SUCCESS|${target_path}|${valid_servers}|${top_speed:-OK}|${duration}s")
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# Final Summary Table
+# ------------------------------------------------------------------------------
+render_summary_table() {
+    echo ""
+    log_step "Ranking Results Summary"
+    echo ""
+
+    local h1; h1=$(repeat_char "${BOX_H}" 13)
+    local h2; h2=$(repeat_char "${BOX_H}" 24)
+    local h3; h3=$(repeat_char "${BOX_H}" 7)
+    local h4; h4=$(repeat_char "${BOX_H}" 11)
+    local h5; h5=$(repeat_char "${BOX_H}" 6)
+    local h6; h6=$(repeat_char "${BOX_H}" 12)
+
+    echo -e "  ${C_SURFACE1}${BOX_TL}${h1}${BOX_TJ}${h2}${BOX_TJ}${h3}${BOX_TJ}${h4}${BOX_TJ}${h5}${BOX_TJ}${h6}${BOX_TR}${C_RESET}"
+    printf "  ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_LAVENDER}%-11s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_LAVENDER}%-22s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_LAVENDER}%5s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_LAVENDER}%9s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_LAVENDER}%4s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_BOLD}${C_LAVENDER}%-10s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET}\n" \
+        "REPOSITORY" "MIRRORLIST FILE" "COUNT" "TOP SPEED" "TIME" "STATUS"
+    echo -e "  ${C_SURFACE1}${BOX_LJ}${h1}${BOX_X}${h2}${BOX_X}${h3}${BOX_X}${h4}${BOX_X}${h5}${BOX_X}${h6}${BOX_RJ}${C_RESET}"
+
+    local total_updated=0
+    for res in "${RUN_RESULTS[@]}"; do
+        IFS='|' read -r repo status file count speed duration <<< "$res"
+        local status_styled=""
+        case "$status" in
+            SUCCESS)
+                local pad=" "; [[ "$SYM_CHECK" == "OK" ]] && pad=""
+                status_styled="${C_GREEN}${SYM_CHECK} SUCCESS${pad}${C_RESET}"
+                total_updated=$((total_updated + 1))
+                ;;
+            DRY-RUN)
+                local pad=" "; [[ "$SYM_WARN" == "!!" ]] && pad=""
+                status_styled="${C_PEACH}${SYM_WARN} DRY-RUN${pad}${C_RESET}"
+                ;;
+            FAILED)
+                local pad="  "; [[ "$SYM_CROSS" == "XX" ]] && pad=" "
+                status_styled="${C_RED}${SYM_CROSS} FAILED${pad}${C_RESET}"
+                ;;
+            *)
+                status_styled=$(printf "%-10s" "$status")
+                ;;
+        esac
+
+        local short_file
+        short_file=$(basename "$file")
+        if (( ${#short_file} > 22 )); then
+            short_file="${short_file:0:19}..."
+        fi
+
+        local speed_short="$speed"
+        if (( ${#speed_short} > 9 )); then
+            speed_short="${speed_short:0:9}"
+        fi
+
+        local dur_short="$duration"
+        if (( ${#dur_short} > 4 )); then
+            dur_short="${dur_short:0:4}"
+        fi
+
+        printf "  ${C_SURFACE1}${BOX_V}${C_RESET} ${C_TEXT}%-11s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_SUBTEXT1}%-22s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_LAVENDER}%5s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_TEAL}%9s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} ${C_SUBTEXT0}%4s${C_RESET} ${C_SURFACE1}${BOX_V}${C_RESET} %b ${C_SURFACE1}${BOX_V}${C_RESET}\n" \
+            "$repo" "$short_file" "$count" "$speed_short" "$dur_short" "$status_styled"
+    done
+
+    echo -e "  ${C_SURFACE1}${BOX_BL}${h1}${BOX_BJ}${h2}${BOX_BJ}${h3}${BOX_BJ}${h4}${BOX_BJ}${h5}${BOX_BJ}${h6}${BOX_BR}${C_RESET}"
+    echo ""
+
+    return 0
+}
+
+# ------------------------------------------------------------------------------
+# Pacman Database Synchronization
+# ------------------------------------------------------------------------------
+handle_pacman_sync() {
+    local updated_count="$1"
+    
+    if [[ "$FLAG_DRY_RUN" = true ]] || [[ "$updated_count" -eq 0 ]]; then
+        return 0
+    fi
+
+    echo ""
+    if [[ "$FLAG_SYNC" == "true" ]]; then
+        log_step "Synchronizing Pacman Databases (pacman -Syy)"
+        pacman -Syy
+        return 0
+    elif [[ "$FLAG_SYNC" == "false" ]]; then
+        log_info "Skipping database synchronization (--no-sync specified)."
+        return 0
+    fi
+
+    # Interactive prompt (FLAG_YES implies yes unless --no-sync)
+    if [[ "$FLAG_YES" = true ]]; then
+        if [[ "$FLAG_SYNC" == "false" ]]; then
+            log_info "Skipping database synchronization (--no-sync specified)."
+            return 0
+        fi
+        log_step "Synchronizing Pacman Databases (pacman -Syy) [auto-yes]"
+        pacman -Syy
+        return 0
+    fi
+    if [[ -t 0 ]]; then
+        printf ' %b%-2s%b %bPacman mirrorlists have been updated.%b\n' "${C_PEACH}" "::" "${C_RESET}" "${C_BOLD}${C_TEXT}" "${C_RESET}"
+        read -rp " Synchronize pacman databases now? (pacman -Syy) [Y/n] " response
+        response=${response:-Y}
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            log_step "Synchronizing Pacman Databases..."
+            pacman -Syy
+        else
+            log_info "Sync skipped. Remember to run 'sudo pacman -Syu' before updating packages."
+        fi
+    else
+        log_info "Non-interactive shell: skipping sync. Run 'sudo pacman -Syu' or re-run with --sync/-y."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# CLI Argument Parsing
+# ------------------------------------------------------------------------------
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -v|--version)
+                echo "rank v${SCRIPT_VERSION}"
+                exit 0
+                ;;
+            -a|--all)
+                FLAG_ALL=true
+                shift
+                ;;
+            -l|--list)
+                FLAG_LIST=true
+                shift
+                ;;
+            -d|--dry-run)
+                FLAG_DRY_RUN=true
+                shift
+                ;;
+            -f|--fast)
+                FLAG_FAST=true
+                shift
+                ;;
+            -y|--yes)
+                FLAG_YES=true
+                shift
+                ;;
+            -s|--sync)
+                FLAG_SYNC=true
+                shift
+                ;;
+            --no-sync)
+                FLAG_SYNC=false
+                shift
+                ;;
+            --no-backup)
+                FLAG_NO_BACKUP=true
+                shift
+                ;;
+            --restore)
+                FLAG_RESTORE=true
+                shift
+                ;;
+            --no-color)
+                disable_color
+                shift
+                ;;
+            -c|--country)
+                if [[ -z "${2:-}" ]] || [[ "$2" =~ ^- ]]; then
+                    log_error "Option '$1' requires a 2-letter country code argument."
+                    exit 1
+                fi
+                OPT_COUNTRY=$(echo "$2" | tr '[:lower:]' '[:upper:]')
+                if ! [[ "$OPT_COUNTRY" =~ ^[A-Z]{2}$ ]]; then
+                    log_error "Option '$1' requires a 2-letter ISO code (e.g. US, DE, BD). Got: $2"
+                    exit 1
+                fi
+                shift 2
+                ;;
+            -m|--max-mirrors)
+                if [[ -z "${2:-}" ]] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                    log_error "Option '$1' requires a numeric argument."
+                    exit 1
+                fi
+                if (( $2 < 1 || $2 > 100 )); then
+                    log_error "Option '$1' must be between 1 and 100. Got: $2"
+                    exit 1
+                fi
+                OPT_MAX_MIRRORS="$2"
+                shift 2
+                ;;
+            --completion)
+                if [[ -z "${2:-}" ]] || ! [[ "$2" =~ ^(0(\.[0-9]+)?|1(\.0*)?)$ ]]; then
+                    log_error "Option '$1' requires a 0-1 float argument (e.g. 0.9, 1). Got: ${2:-<empty>}"
+                    exit 1
+                fi
+                OPT_COMPLETION="$2"
+                shift 2
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                echo "Run 'rank --help' for usage instructions."
+                exit 1
+                ;;
+            *)
+                TARGET_REPOS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
+# Interactive Target Selection Menu
+select_repositories_interactive() {
+    local -n _out_repos="$1"
+    shift
+    local detected=("$@")
+    echo ""
+    log_step "Select Repositories to Benchmark"
+    echo -e "  ${C_SUBTEXT0}Multiple active repositories detected on your system:${C_RESET}"
+    echo ""
+
+    local idx=1
+    for r in "${detected[@]}"; do
+        local r_desc=""
+        for entry in "${REPO_CATALOG[@]}"; do
+            IFS=':' read -r cat_id _sub _file _max desc <<< "$entry"
+            if [[ "$cat_id" == "$r" ]]; then
+                r_desc="$desc"
+                break
+            fi
+        done
+        printf "   ${C_MAUVE}[%d]${C_RESET} ${C_BOLD}${C_TEXT}%-14s${C_RESET} ${C_OVERLAY0}%s${C_RESET}\n" "$idx" "$r" "$r_desc"
+        idx=$((idx + 1))
+    done
+    printf "   ${C_MAUVE}[a]${C_RESET} ${C_BOLD}${C_LAVENDER}%-14s${C_RESET} ${C_OVERLAY0}Benchmark all detected repositories (default)${C_RESET}\n" "All"
+    printf "   ${C_MAUVE}[q]${C_RESET} ${C_BOLD}${C_RED}%-14s${C_RESET} ${C_OVERLAY0}Quit without ranking${C_RESET}\n" "Quit"
+
+    echo ""
+    local user_sel
+    read -rp "  Select targets [1-$((idx-1)), a, or Enter for all]: " user_sel || true
+    user_sel=$(echo "$user_sel" | tr '[:upper:]' '[:lower:]' | tr ',' ' ' | xargs 2>/dev/null || true)
+
+    if [[ -z "$user_sel" || "$user_sel" == "a" || "$user_sel" == "all" ]]; then
+        _out_repos=("${detected[@]}")
+        return 0
+    elif [[ "$user_sel" == "q" || "$user_sel" == "quit" ]]; then
+        echo ""
+        log_info "Operation cancelled by user."
+        exit 0
+    fi
+
+    local chosen=()
+    for token in $user_sel; do
+        if [[ "$token" =~ ^[0-9]+$ ]] && (( token >= 1 && token <= ${#detected[@]} )); then
+            local picked="${detected[$((token - 1))]}"
+            local already=false
+            for c in "${chosen[@]}"; do
+                [[ "$c" == "$picked" ]] && already=true && break
+            done
+            [[ "$already" = false ]] && chosen+=("$picked")
+        else
+            log_warn "Ignoring unrecognized option: $token"
+        fi
+    done
+
+    if [[ ${#chosen[@]} -eq 0 ]]; then
+        log_warn "No valid repositories selected. Benchmarking all detected repositories."
+        _out_repos=("${detected[@]}")
+    else
+        _out_repos=("${chosen[@]}")
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Main Entry Point
+# ------------------------------------------------------------------------------
+main() {
+    # Save original argv so ensure_privileges can re-exec with identical flags
+    local orig_args=("$@")
+    # Cleanup temp files on normal exit; restore cursor on interrupt
+    trap cleanup_tmpfiles EXIT
+    trap 'tput cnorm 2>/dev/null || true; cleanup_tmpfiles; echo "" >&2; exit 130' INT TERM
+
+    parse_arguments "${orig_args[@]}"
+
+    # --no-color may arrive via CLI after startup: already handled in parse_arguments.
+    # Respect NO_COLOR even if stdout is a TTY (idempotent)
+    if [[ -n "${NO_COLOR:-}" ]]; then
+        disable_color
+    fi
+
+    # Handle --list early
+    if [[ "$FLAG_LIST" = true ]]; then
+        list_repositories
+        exit 0
+    fi
+
+    # Ensure root/sudo privileges at the very first before interactive menus or benchmarks
+    ensure_privileges "${orig_args[@]}"
+
+    # Created after elevation: a pre-sudo TMP_DIR would leak, as exec
+    # replaces the process without running the EXIT trap.
+    init_tmpdir
+
+    # Handle --restore
+    if [[ "$FLAG_RESTORE" = true ]]; then
+        restore_backups_menu
+        exit 0
+    fi
+
+    print_banner
+    print_dry_run_watermark
+
+    # Pre-flight Check: rate-mirrors installed?
+    if ! command -v rate-mirrors >/dev/null 2>&1; then
+        log_error "'rate-mirrors' binary not found in PATH."
+        echo ""
+        echo "  Please install rate-mirrors before running this script:"
+        echo "    - Arch Linux:  sudo pacman -S rate-mirrors"
+        echo "    - AUR:         yay -S rate-mirrors"
+        echo "    - Cargo:       cargo install rate-mirrors"
+        echo ""
+        exit 1
+    fi
+
+    # Determine Targets
+    local active_repos=()
+    if [[ "$FLAG_ALL" = true ]]; then
+        local detected_str
+        detected_str=$(detect_active_repositories)
+        read -r -a active_repos <<< "$detected_str" || true
+        if [[ ${#active_repos[@]} -eq 0 ]]; then
+            log_warn "No active repositories detected for --all; falling back to 'arch'."
+            active_repos=("arch")
+        fi
+        if [[ ${#TARGET_REPOS[@]} -gt 0 ]]; then
+            log_warn "--all specified with explicit repos (${TARGET_REPOS[*]}); explicit list wins."
+            active_repos=("${TARGET_REPOS[@]}")
+        fi
+    elif [[ ${#TARGET_REPOS[@]} -gt 0 ]]; then
+        # User specified targets
+        active_repos=("${TARGET_REPOS[@]}")
+    else
+        # Auto-detection
+        local detected_str
+        detected_str=$(detect_active_repositories)
+        read -r -a active_repos <<< "$detected_str" || true
+
+        if [[ ${#active_repos[@]} -eq 0 ]]; then
+            log_warn "No supported mirrorlist files or configurations detected."
+            log_info "Falling back to default 'arch' mirrorlist."
+            active_repos=("arch")
+        elif [[ ${#active_repos[@]} -gt 1 ]] && [[ -t 0 ]] && [[ "$FLAG_YES" = false ]]; then
+            select_repositories_interactive active_repos "${active_repos[@]}"
+        fi
+    fi
+
+    # Spinner column width: longest repo id in THIS run only, so a lone
+    # short id (e.g. arch) gets no dead space yet multi-repo runs align.
+    REPO_COL_WIDTH=0
+    local _rw
+    for _rw in "${active_repos[@]}"; do
+        (( ${#_rw} > REPO_COL_WIDTH )) && REPO_COL_WIDTH=${#_rw}
+    done
+
+    # Inform user of targets
+    log_info "Detected ${#active_repos[@]} target repository(ies): ${C_BOLD}${C_LAVENDER}${active_repos[*]}${C_RESET}"
+    if [[ "$FLAG_FAST" = true ]]; then
+        log_info "Performance mode: ${C_PEACH}FAST${C_RESET} ${C_SUBTEXT0}(high concurrency, low timeouts)${C_RESET}"
+    fi
+    if [[ -n "$OPT_COUNTRY" ]]; then
+        log_info "Entry country:    ${C_TEAL}${OPT_COUNTRY}${C_RESET}"
+    fi
+    if [[ "$FLAG_DRY_RUN" = true ]]; then
+        log_warn "Running in DRY-RUN mode. No files will be overwritten."
+    fi
+
+    # Single-instance lock (skip for dry-run/list so benchmarking stays testable).
+    # /run/lock is root-owned, so a fixed lock path can't be symlink-squatted
+    # the way a /tmp path could when this runs as root.
+    local lock_file="/run/lock/rank.lock"
+    [[ -d "/run/lock" ]] || lock_file="/tmp/rank.lock"
+    if [[ "$FLAG_DRY_RUN" = false ]]; then
+        exec 9>"$lock_file"
+        if ! flock -n 9 2>/dev/null; then
+            log_error "Another rank instance is running (lock: $lock_file)."
+            exit 1
+        fi
+    fi
+
+    # Pre-flight: writable target dirs (fail fast before minutes of benchmarking)
+    if [[ "$FLAG_DRY_RUN" = false ]]; then
+        local _pre
+        for _pre in "${active_repos[@]}"; do
+            for entry in "${REPO_CATALOG[@]}"; do
+                IFS=':' read -r cat_id _sub _file _max _desc <<< "$entry"
+                if [[ "$cat_id" == "$_pre" ]]; then
+                    local _dir="${PACMAN_D}"
+                    if [[ ! -d "$_dir" ]]; then
+                        log_error "Target directory missing: $_dir (repo: $cat_id)"
+                        exit 1
+                    fi
+                    if [[ -e "${_dir}/${_file}" ]] && [[ ! -w "${_dir}/${_file}" ]] && [[ $EUID -ne 0 ]]; then
+                        log_error "Target not writable: ${_dir}/${_file}"
+                        exit 1
+                    fi
+                fi
+            done
+        done
+    fi
+
+    # Process each target repository
+    local updated_count=0
+    local repo_idx=1
+    local total_repos=${#active_repos[@]}
+    for repo_id in "${active_repos[@]}"; do
+        local matched=false
+        for entry in "${REPO_CATALOG[@]}"; do
+            IFS=':' read -r cat_id subcommand filename default_max desc <<< "$entry"
+            if [[ "$cat_id" == "$repo_id" ]]; then
+                matched=true
+                if benchmark_repo "$cat_id" "$subcommand" "$filename" "$default_max" "$desc" "$repo_idx" "$total_repos"; then
+                    updated_count=$((updated_count + 1))
+                fi
+                break
+            fi
+        done
+
+        if [[ "$matched" = false ]]; then
+            log_warn "Unknown repository '${repo_id}'. Supported: arch, chaotic-aur, archlinuxcn, endeavouros, cachyos, blackarch, arch4edu, artix, arcolinux, manjaro"
+        fi
+        repo_idx=$((repo_idx + 1))
+    done
+
+    # Print Summary Table
+    render_summary_table
+
+    # Database synchronization prompt
+    handle_pacman_sync "$updated_count"
+
+    log_success "All operations completed."
+}
+
+main "$@"

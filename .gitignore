@@ -1,0 +1,6 @@
+# Editor / OS noise only — the scripts in this repo have no extension,
+# so keep this file minimal and never add bare `*` rules.
+*~
+*.swp
+*.swo
+.DS_Store

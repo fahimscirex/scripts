@@ -1,0 +1,872 @@
+#!/usr/bin/env bash
+#
+# archclean — a safe system cleaner for Arch Linux
+#
+# Derived from the System Cleaner of Stacer (https://github.com/oguzhaninan/Stacer),
+# reimagined as a dependency-free CLI focused on Arch Linux.
+#
+# Design principles:
+#   * Safe by default   — scanning reports only; nothing is ever deleted without
+#                         an explicit `clean` subcommand AND a confirmation.
+#   * No harmful deletes — package cache uses `paccache` (keeps recent versions),
+#                         logs use `journalctl --vacuum` (never a blind rm of
+#                         /var/log), and every path is hard-coded and guarded so
+#                         an empty variable can never turn into `rm -rf /`.
+#   * Transparent       — every category shows its size before you act, and a
+#                         --dry-run mode prints exactly what would happen.
+#   * Native tooling    — a tool's own cache-clearing command is used when it is
+#                         installed (it respects relocated caches and won't race
+#                         a concurrent run); rm is only the fallback.
+#
+# License: GPL-3.0 (inherited from Stacer). See LICENSE.
+
+set -euo pipefail
+
+readonly VERSION="1.0.0"
+readonly PROG="${0##*/}"
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'; C_CYAN=$'\033[36m'
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""
+    C_YELLOW=""; C_BLUE=""; C_CYAN=""
+fi
+
+info()  { printf '%s\n' "$*"; }
+note()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+warn()  { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()   { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+ok()    { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+die()   { err "$*"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Global options (set by argument parsing)
+# ---------------------------------------------------------------------------
+DRY_RUN=0
+ASSUME_YES=0
+KEEP_VERSIONS=1          # package versions paccache retains (config: keep_versions)
+JOURNAL_KEEP="2weeks"    # journald retention for `logs` (config: journal_keep)
+declare -a SELECTED=()
+declare -a EXCLUDES=()   # glob patterns protected from deletion (config: exclude)
+declare -a EXCLUDE_ARGS=()  # built into find predicates by build_exclude_args
+
+# Config file locations, lowest to highest precedence. User config overrides
+# the system config; CLI flags override both.
+readonly SYSTEM_CONFIG="/etc/archclean.conf"
+user_config_path() {
+    printf '%s/archclean/config' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+# All supported categories, in scan order.
+readonly ALL_CATEGORIES=(pkgcache orphans crash coredump logs cache trash claude agy npm npx bun go cargo uv)
+
+# ---------------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------------
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Load settings from a config file. The file is PARSED, not sourced, so it can
+# never execute arbitrary code. Only known keys are honoured; anything else is
+# reported and ignored. Format: `key = value`, with `#` comments.
+load_config_file() {
+    local file="$1"
+    [[ -r "$file" ]] || return 0
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"                       # strip comments
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        key="${line%%=*}"; value="${line#*=}"
+        # trim surrounding whitespace and optional quotes
+        key="$(printf '%s' "$key" | tr -d '[:space:]')"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        value="${value%\"}"; value="${value#\"}"
+        value="${value%\'}"; value="${value#\'}"
+        case "$key" in
+            keep_versions)
+                [[ "$value" =~ ^[0-9]+$ ]] && KEEP_VERSIONS="$value" \
+                    || warn "$file: keep_versions must be a number (got '$value')" ;;
+            journal_keep)  JOURNAL_KEEP="$value" ;;
+            exclude)
+                # Comma-separated list; each entry is a protected glob.
+                local IFS=','
+                local pat
+                for pat in $value; do
+                    pat="${pat#"${pat%%[![:space:]]*}"}"; pat="${pat%"${pat##*[![:space:]]}"}"
+                    [[ -n "$pat" ]] && EXCLUDES+=("$pat")
+                done ;;
+            assume_yes)    [[ "$value" =~ ^(1|true|yes)$ ]] && ASSUME_YES=1 ;;
+            dry_run)       [[ "$value" =~ ^(1|true|yes)$ ]] && DRY_RUN=1 ;;
+            *)             warn "$file: ignoring unknown setting '$key'" ;;
+        esac
+    done < "$file"
+}
+
+# Apply system config then user config (user wins). Called before arg parsing so
+# CLI flags always override config.
+load_config() {
+    load_config_file "$SYSTEM_CONFIG"
+    load_config_file "$(user_config_path)"
+}
+
+# Human-readable byte count.
+human() {
+    local bytes="${1:-0}" out
+    if have numfmt; then
+        out=$(numfmt --to=iec --suffix=B --format='%.1f' "$bytes" 2>/dev/null || printf '%sB' "$bytes")
+        printf '%s' "${out/.0B/B}"
+    else
+        printf '%sB' "$bytes"
+    fi
+}
+
+# Total size in bytes of the given existing paths (0 if none exist).
+size_of() {
+    local total=0 p sz
+    for p in "$@"; do
+        [[ -e "$p" ]] || continue
+        sz=$(du -sb --apparent-size "$p" 2>/dev/null | awk '{print $1}') || sz=0
+        total=$(( total + ${sz:-0} ))
+    done
+    printf '%s' "$total"
+}
+
+# Ask a yes/no question. Honours --yes. Returns 0 for yes.
+confirm() {
+    local prompt="$1"
+    if (( ASSUME_YES )); then
+        return 0
+    fi
+    local reply
+    printf '%s%s%s [y/N] ' "$C_BOLD" "$prompt" "$C_RESET"
+    read -r reply || return 1
+    [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+# Run a command as root when needed. Prints (but does not run) under --dry-run.
+run_root() {
+    if (( DRY_RUN )); then
+        note "  would run: sudo $*"
+        return 0
+    fi
+    if (( EUID == 0 )); then
+        "$@"
+    elif have sudo; then
+        sudo "$@"
+    else
+        die "root privileges required (install sudo or run as root): $*"
+    fi
+}
+
+# Run a command as the invoking user. Prints (but does not run) under --dry-run.
+run_user() {
+    if (( DRY_RUN )); then
+        note "  would run: $*"
+        return 0
+    fi
+    "$@"
+}
+
+# Guard: refuse to operate on an empty or root path.
+safe_path() {
+    local p="$1"
+    [[ -n "$p" && "$p" != "/" ]]
+}
+
+# Build find predicates from EXCLUDES so protected files/folders are skipped.
+# An entry is kept if its full path OR its basename matches any exclude glob.
+build_exclude_args() {
+    EXCLUDE_ARGS=()
+    local p
+    for p in "${EXCLUDES[@]}"; do
+        [[ -n "$p" ]] || continue
+        EXCLUDE_ARGS+=( ! -path "$p" ! -name "$p" )
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Category: pacman package cache
+# ---------------------------------------------------------------------------
+readonly PKG_CACHE_DIR="/var/cache/pacman/pkg"
+
+pkgcache_size() { size_of "$PKG_CACHE_DIR"; }
+
+pkgcache_desc() {
+    local n
+    n=$(find "$PKG_CACHE_DIR" -maxdepth 1 -type f -name '*.pkg.tar*' 2>/dev/null | wc -l)
+    printf 'cached packages: %s (keeps %s newest per package on clean)' "$n" "$KEEP_VERSIONS"
+}
+
+pkgcache_clean() {
+    [[ -d "$PKG_CACHE_DIR" ]] || { note "  no pacman cache present"; return 0; }
+    if have paccache; then
+        # paccache keeps the N most recent versions of every package — the safe
+        # way to reclaim space without breaking downgrades/reinstalls.
+        run_root paccache -rk "$KEEP_VERSIONS"
+        # Remove cached packages that are no longer installed at all.
+        run_root paccache -ruk0
+    else
+        warn "paccache not found (install 'pacman-contrib' for safe cache trimming)."
+        warn "Skipping package cache — refusing to blindly delete all cached packages."
+        return 0
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Category: orphaned packages (new addition — common Arch maintenance)
+# ---------------------------------------------------------------------------
+orphans_list() {
+    have pacman || return 0
+    pacman -Qtdq 2>/dev/null || true
+}
+
+orphans_size() {
+    local pkgs sz
+    pkgs=$(orphans_list)
+    [[ -n "$pkgs" ]] || { printf '0'; return; }
+    # Sum installed sizes (bytes) reported by pacman.
+    sz=$(pacman -Qi $pkgs 2>/dev/null \
+        | awk -F': *' '/^Installed Size/ {
+            v=$2; sub(/ .*/,"",v); u=$2; sub(/^[0-9.]+ /,"",u);
+            mult=1;
+            if (u ~ /KiB/) mult=1024; else if (u ~ /MiB/) mult=1048576;
+            else if (u ~ /GiB/) mult=1073741824;
+            total += v*mult
+        } END {printf "%d", total}')
+    printf '%s' "${sz:-0}"
+}
+
+orphans_desc() {
+    local pkgs
+    pkgs=$(orphans_list)
+    if [[ -z "$pkgs" ]]; then
+        printf 'no orphaned packages'
+    else
+        # shellcheck disable=SC2206 -- intentional word-splitting of pacman -Qtdq output
+        local -a arr=($pkgs)
+        local count=${#arr[@]}
+        local names="${arr[*]:0:5}"
+        (( count > 5 )) && names+=" (+$((count-5)) more)"
+        printf 'orphaned packages: %s (%s)' "$count" "$names"
+    fi
+}
+
+orphans_clean() {
+    local pkgs
+    pkgs=$(orphans_list)
+    [[ -n "$pkgs" ]] || { note "  no orphaned packages"; return 0; }
+    # -Rs removes the package plus its now-unneeded deps (no -n: user configs are kept).
+    # shellcheck disable=SC2086 -- intentional word-splitting of pacman -Qtdq output
+    run_root pacman -Rs --noconfirm $pkgs
+}
+
+# ---------------------------------------------------------------------------
+# Category: crash reports
+# ---------------------------------------------------------------------------
+readonly CRASH_DIR="/var/crash"
+
+crash_size() { size_of "$CRASH_DIR"; }
+
+crash_desc() {
+    local n
+    n=$(find "$CRASH_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    printf 'crash report files: %s' "$n"
+}
+
+crash_clean() {
+    [[ -d "$CRASH_DIR" ]] || { note "  no crash reports"; return 0; }
+    safe_path "$CRASH_DIR" || die "refusing unsafe path"
+    # Only regular files at the top level — never recurse into the mountpoint.
+    if (( DRY_RUN )); then
+        find "$CRASH_DIR" -maxdepth 1 -type f "${EXCLUDE_ARGS[@]}" \
+            -printf '  would delete: %p\n' 2>/dev/null || true
+    else
+        run_root find "$CRASH_DIR" -maxdepth 1 -type f "${EXCLUDE_ARGS[@]}" -delete
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Category: system logs (journald) — safe replacement for deleting /var/log
+# ---------------------------------------------------------------------------
+logs_size() {
+    have journalctl || { printf '0'; return; }
+    # journalctl --disk-usage prints e.g. "... journals take up 1.2G in the ..."
+    local raw bytes
+    raw=$(journalctl --disk-usage 2>/dev/null \
+        | grep -oE '[0-9]+(\.[0-9]+)?[KMGT]?B?' | head -1) || raw=""
+    if [[ -n "$raw" ]] && have numfmt; then
+        # Strip a trailing 'B' if present; numfmt --from=iec wants e.g. 35.3M.
+        bytes=$(numfmt --from=iec "${raw%B}" 2>/dev/null) || bytes=0
+        printf '%s' "${bytes:-0}"
+    else
+        printf '0'
+    fi
+}
+
+logs_desc() {
+    printf 'systemd journal (vacuum to keep last %s on clean)' "$JOURNAL_KEEP"
+}
+
+logs_clean() {
+    have journalctl || { note "  journalctl not available"; return 0; }
+    # Vacuuming rotates/removes archived journals older than the retention window.
+    # Active logs are never touched — this cannot break logging.
+    run_root journalctl --vacuum-time="$JOURNAL_KEEP"
+}
+
+# ---------------------------------------------------------------------------
+# Category: user application cache (~/.cache)
+# ---------------------------------------------------------------------------
+user_home() {
+    # Resolve the invoking user's home even under sudo.
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        getent passwd "$SUDO_USER" | cut -d: -f6
+    else
+        printf '%s' "${HOME:-}"
+    fi
+}
+
+cache_dir() { printf '%s/.cache' "$(user_home)"; }
+
+cache_size() { size_of "$(cache_dir)"; }
+
+cache_desc() {
+    local d n
+    d=$(cache_dir)
+    n=$(find "$d" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l)
+    printf 'user cache entries in %s: %s' "$d" "$n"
+}
+
+cache_clean() {
+    local home d
+    home=$(user_home)
+    [[ -n "$home" && -d "$home" ]] || die "cannot resolve a home directory to clean"
+    d=$(cache_dir)
+    safe_path "$d" || die "refusing unsafe cache path"
+    [[ "$d" == */.cache ]] || die "cache path sanity check failed: $d"
+    [[ -d "$d" ]] || { note "  no user cache"; return 0; }
+    # Delete the CONTENTS of ~/.cache, not the directory itself.
+    if (( DRY_RUN )); then
+        find "$d" -maxdepth 1 -mindepth 1 "${EXCLUDE_ARGS[@]}" \
+            -printf '  would delete: %p\n' 2>/dev/null || true
+    else
+        run_user find "$d" -maxdepth 1 -mindepth 1 "${EXCLUDE_ARGS[@]}" -exec rm -rf {} +
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Category: trash (~/.local/share/Trash)
+# ---------------------------------------------------------------------------
+trash_dir() { printf '%s/.local/share/Trash' "$(user_home)"; }
+
+trash_size() { size_of "$(trash_dir)/files" "$(trash_dir)/info"; }
+
+trash_desc() {
+    local d n
+    d=$(trash_dir)
+    n=$(find "$d/files" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l)
+    printf 'trashed items: %s' "$n"
+}
+
+trash_clean() {
+    # gio empties every trash it knows about (mounts included); it has no
+    # per-entry filter, so -x does not apply on this path.
+    if have gio; then
+        run_user gio trash --empty || warn "gio trash --empty failed"
+        return 0
+    fi
+    local home d
+    home=$(user_home)
+    [[ -n "$home" && -d "$home" ]] || die "cannot resolve a home directory to clean"
+    d=$(trash_dir)
+    safe_path "$d" || die "refusing unsafe trash path"
+    [[ "$d" == */.local/share/Trash ]] || die "trash path sanity check failed: $d"
+    local sub
+    for sub in files info; do
+        [[ -d "$d/$sub" ]] || continue
+        if (( DRY_RUN )); then
+            find "$d/$sub" -maxdepth 1 -mindepth 1 "${EXCLUDE_ARGS[@]}" \
+                -printf '  would delete: %p\n' 2>/dev/null || true
+        else
+            run_user find "$d/$sub" -maxdepth 1 -mindepth 1 "${EXCLUDE_ARGS[@]}" -exec rm -rf {} +
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Category: old Claude Code versions (~/.local/share/claude/versions)
+# The launcher symlink points at the active version; everything else is stale.
+# ---------------------------------------------------------------------------
+claude_versions_dir() { printf '%s/.local/share/claude/versions' "$(user_home)"; }
+
+# Version dir name the `claude` launcher currently points at (empty if unknown).
+claude_current_version() {
+    local link
+    link=$(readlink -f "$(user_home)/.local/bin/claude" 2>/dev/null) || return 0
+    case "$link" in
+        */versions/*) printf '%s' "${link#*/versions/}" | cut -d/ -f1 ;;
+    esac
+}
+
+# Absolute paths of every version blob except the current one, one per line.
+# Each version is a single self-contained binary file; the launcher symlinks it.
+claude_old_versions() {
+    local dir cur d name
+    dir=$(claude_versions_dir)
+    [[ -d "$dir" ]] || return 0
+    cur=$(claude_current_version)
+    [[ -n "$cur" ]] || return 0   # can't identify current -> refuse to list any as old
+    for d in "$dir"/*; do
+        [[ -f "$d" ]] || continue   # version blobs are files; skip locks/ etc.
+        name="${d##*/}"
+        [[ "$name" == "$cur" ]] && continue
+        printf '%s\n' "$d"
+    done
+}
+
+claude_size() {
+    local -a old; mapfile -t old < <(claude_old_versions)
+    (( ${#old[@]} )) || { printf '0'; return; }
+    size_of "${old[@]}"
+}
+
+claude_desc() {
+    local -a old; mapfile -t old < <(claude_old_versions)
+    local cur; cur=$(claude_current_version)
+    if (( ${#old[@]} == 0 )); then
+        printf 'no old Claude Code versions%s' "${cur:+ (current $cur)}"
+    else
+        printf 'old Claude Code versions: %s (keeps current%s)' "${#old[@]}" "${cur:+ $cur}"
+    fi
+}
+
+claude_clean() {
+    local -a old; mapfile -t old < <(claude_old_versions)
+    (( ${#old[@]} )) || { note "  no old Claude Code versions"; return 0; }
+    local d
+    for d in "${old[@]}"; do
+        safe_path "$d" || continue
+        case "$d" in */versions/*) ;; *) continue ;; esac   # sanity guard
+        if (( DRY_RUN )); then
+            note "  would delete: $d"
+        else
+            run_user rm -rf -- "$d"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Category: old agy (antigravity-cli) binaries
+# agy self-updates by renaming the old binary to agy.<timestamp>.old beside it.
+# ponytail: assumes agy lives in ~/.local/bin (this installer's default).
+# ---------------------------------------------------------------------------
+agy_bin_dir() { printf '%s/.local/bin' "$(user_home)"; }
+
+agy_old_binaries() {
+    local d f; d=$(agy_bin_dir)
+    [[ -d "$d" ]] || return 0
+    for f in "$d"/agy.*.old; do
+        [[ -f "$f" ]] && printf '%s\n' "$f"
+    done
+}
+
+agy_size() {
+    local -a old; mapfile -t old < <(agy_old_binaries)
+    (( ${#old[@]} )) || { printf '0'; return; }
+    size_of "${old[@]}"
+}
+
+agy_desc() {
+    local -a old; mapfile -t old < <(agy_old_binaries)
+    (( ${#old[@]} )) && printf 'old agy binaries: %s' "${#old[@]}" \
+                     || printf 'no old agy binaries'
+}
+
+agy_clean() {
+    local -a old; mapfile -t old < <(agy_old_binaries)
+    (( ${#old[@]} )) || { note "  no old agy binaries"; return 0; }
+    local f
+    for f in "${old[@]}"; do
+        case "$f" in */agy.*.old) ;; *) continue ;; esac   # sanity guard
+        if (( DRY_RUN )); then
+            note "  would delete: $f"
+        else
+            run_user rm -f -- "$f"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Category: JS toolchain caches (npm / npx / bun) — regenerable download caches
+# ---------------------------------------------------------------------------
+# Delete the CONTENTS of a regenerable cache dir, guarding the expected suffix.
+clean_cache_contents() {
+    local d="$1" suffix="$2"
+    [[ -d "$d" ]] || { note "  nothing to clean ($d)"; return 0; }
+    safe_path "$d" || die "refusing unsafe path: $d"
+    [[ "$d" == *"$suffix" ]] || die "cache path sanity check failed: $d"
+    if (( DRY_RUN )); then
+        find "$d" -maxdepth 1 -mindepth 1 -printf '  would delete: %p\n' 2>/dev/null || true
+    else
+        run_user find "$d" -maxdepth 1 -mindepth 1 -exec rm -rf {} +
+    fi
+}
+
+cache_dir_desc() {  # "<label> (<dir>)" or "no <label>"
+    local dir="$1" label="$2"
+    [[ -d "$dir" ]] && printf '%s (%s)' "$label" "$dir" || printf 'no %s' "$label"
+}
+
+# Use a tool's own cache-clearing command when it's installed; rm the contents
+# directly only when it isn't. Args: <fallback dir> <suffix> <tool> [args...].
+clean_cache_native() {
+    local fallback_dir="$1" suffix="$2" tool="$3"; shift 3
+    if have "$tool"; then
+        # Never retry with rm: the tool may have refused because another
+        # instance is using the cache, and deleting it then corrupts that run.
+        run_user "$tool" "$@" || warn "$tool failed; cache left untouched"
+    else
+        clean_cache_contents "$fallback_dir" "$suffix"
+    fi
+}
+
+npm_cache_dir() { printf '%s/.npm/_cacache' "$(user_home)"; }
+npm_size()  { size_of "$(npm_cache_dir)"; }
+npm_desc()  { cache_dir_desc "$(npm_cache_dir)" "npm download cache"; }
+npm_clean() { clean_cache_native "$(npm_cache_dir)" "/.npm/_cacache" npm cache clean --force; }
+
+npx_cache_dir() { printf '%s/.npm/_npx' "$(user_home)"; }
+npx_size()  { size_of "$(npx_cache_dir)"; }
+npx_desc()  { cache_dir_desc "$(npx_cache_dir)" "npx package cache"; }
+npx_clean() { clean_cache_native "$(npx_cache_dir)" "/.npm/_npx" npm cache npx rm --force; }
+
+# ponytail: assumes the default BUN_INSTALL (~/.bun); override support if needed
+bun_cache_dir() { printf '%s/.bun/install/cache' "$(user_home)"; }
+bun_size()  { size_of "$(bun_cache_dir)"; }
+bun_desc()  { cache_dir_desc "$(bun_cache_dir)" "bun install cache"; }
+# -g is required: without it `bun pm cache rm` needs a package.json in the cwd.
+bun_clean() { clean_cache_native "$(bun_cache_dir)" "/.bun/install/cache" bun pm cache rm -g; }
+
+# ---------------------------------------------------------------------------
+# Category: Go build + module cache
+# The module cache is stored read-only, so plain rm fails — `go clean` is the
+# native tool that handles it. ponytail: build cache overlaps ~/.cache (cache
+# category); resolves paths via the invoking user's `go env`, so run as you.
+# ---------------------------------------------------------------------------
+go_cache_dirs() {
+    have go || return 0
+    go env GOMODCACHE GOCACHE 2>/dev/null
+}
+
+go_size() {
+    local -a dirs; mapfile -t dirs < <(go_cache_dirs)
+    (( ${#dirs[@]} )) || { printf '0'; return; }
+    size_of "${dirs[@]}"
+}
+
+go_desc() {
+    have go || { printf 'go not installed'; return; }
+    local -a dirs; mapfile -t dirs < <(go_cache_dirs)
+    printf 'go build + module cache: %s' "${dirs[*]:-none}"
+}
+
+go_clean() {
+    have go || { note "  go not installed"; return 0; }
+    # -cache = build cache, -modcache = downloaded modules (read-only-safe).
+    run_user go clean -cache -modcache
+}
+
+# ---------------------------------------------------------------------------
+# Category: cargo registry cache (~/.cargo/registry) — cache + src only
+# `index` is left intact (small, and expensive to rebuild); cache/ and src/ are
+# downloaded/extracted crates that cargo re-fetches on demand.
+# ---------------------------------------------------------------------------
+cargo_registry_dir() { printf '%s/.cargo/registry' "$(user_home)"; }
+cargo_size() { size_of "$(cargo_registry_dir)/cache" "$(cargo_registry_dir)/src"; }
+cargo_desc() {
+    local r; r=$(cargo_registry_dir)
+    [[ -d "$r" ]] && printf 'cargo registry cache + src (%s); keeps index' "$r" \
+                  || printf 'no cargo registry'
+}
+cargo_clean() {
+    local r; r=$(cargo_registry_dir)
+    clean_cache_contents "$r/cache" "/.cargo/registry/cache"
+    clean_cache_contents "$r/src"   "/.cargo/registry/src"
+}
+
+# ---------------------------------------------------------------------------
+# Category: uv cache — cleared with `uv cache clean`
+# ponytail: default path is under ~/.cache, which the `cache` category also clears
+# ---------------------------------------------------------------------------
+uv_cache_dir() {
+    have uv || return 0
+    uv cache dir 2>/dev/null || return 0
+}
+
+uv_size() {
+    local d; d=$(uv_cache_dir)
+    [[ -n "$d" ]] || { printf '0'; return; }
+    size_of "$d"
+}
+
+uv_desc() {
+    have uv || { printf 'uv not installed'; return; }
+    printf 'uv cache (%s)' "$(uv_cache_dir)"
+}
+
+uv_clean() {
+    have uv || { note "  uv not installed"; return 0; }
+    run_user uv cache clean
+}
+
+# ---------------------------------------------------------------------------
+# Category: systemd core dumps (/var/lib/systemd/coredump) — disposable crashes
+# ---------------------------------------------------------------------------
+readonly COREDUMP_DIR="/var/lib/systemd/coredump"
+
+coredump_size() { size_of "$COREDUMP_DIR"; }
+
+coredump_desc() {
+    local n
+    n=$(find "$COREDUMP_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    printf 'systemd core dumps: %s' "$n"
+}
+
+coredump_clean() {
+    [[ -d "$COREDUMP_DIR" ]] || { note "  no core dumps"; return 0; }
+    safe_path "$COREDUMP_DIR" || die "refusing unsafe path"
+    # Only regular files at the top level — same guard style as crash reports.
+    if (( DRY_RUN )); then
+        find "$COREDUMP_DIR" -maxdepth 1 -type f "${EXCLUDE_ARGS[@]}" \
+            -printf '  would delete: %p\n' 2>/dev/null || true
+    else
+        run_root find "$COREDUMP_DIR" -maxdepth 1 -type f "${EXCLUDE_ARGS[@]}" -delete
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Category dispatch helpers
+# ---------------------------------------------------------------------------
+category_title() {
+    case "$1" in
+        pkgcache) echo "Package cache" ;;
+        orphans)  echo "Orphaned packages" ;;
+        crash)    echo "Crash reports" ;;
+        logs)     echo "System logs" ;;
+        cache)    echo "Application cache" ;;
+        trash)    echo "Trash" ;;
+        claude)   echo "Claude Code versions" ;;
+        agy)      echo "Old agy binaries" ;;
+        npm)      echo "npm cache" ;;
+        npx)      echo "npx cache" ;;
+        bun)      echo "bun cache" ;;
+        go)       echo "Go cache" ;;
+        cargo)    echo "Cargo cache" ;;
+        uv)       echo "uv cache" ;;
+        coredump) echo "Core dumps" ;;
+    esac
+}
+
+is_category() {
+    local c
+    for c in "${ALL_CATEGORIES[@]}"; do
+        [[ "$c" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_scan() {
+    local -a cats=("${SELECTED[@]}")
+    (( ${#cats[@]} )) || cats=("${ALL_CATEGORIES[@]}")
+
+    printf '%s%sarchclean scan%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+    local total=0 c size
+    for c in "${cats[@]}"; do
+        size=$("${c}_size")
+        total=$(( total + ${size:-0} ))
+        printf '  %s%-20s%s %10s   %s%s%s\n' \
+            "$C_BOLD" "$(category_title "$c")" "$C_RESET" \
+            "$(human "$size")" \
+            "$C_DIM" "$("${c}_desc")" "$C_RESET"
+    done
+    printf '\n  %s%-20s %10s%s\n' "$C_BOLD" "Total size:" "$(human "$total")" "$C_RESET"
+    printf '\n%sRun `%s clean <category...>` or `%s clean --all` to reclaim space.%s\n' \
+        "$C_DIM" "$PROG" "$PROG" "$C_RESET"
+}
+
+cmd_clean() {
+    local -a cats=("${SELECTED[@]}")
+    if (( ${#cats[@]} == 0 )); then
+        die "no categories selected. Pass one or more of: ${ALL_CATEGORIES[*]}  (or --all)"
+    fi
+
+    build_exclude_args
+
+    # Report first so the user sees the impact.
+    printf '%s%sarchclean clean%s%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET" \
+        "$( ((DRY_RUN)) && printf ' (dry-run)' )"
+    local total=0 c size
+    for c in "${cats[@]}"; do
+        size=$("${c}_size")
+        total=$(( total + ${size:-0} ))
+        printf '  %s%-20s%s %10s\n' "$C_BOLD" "$(category_title "$c")" "$C_RESET" "$(human "$size")"
+    done
+    printf '\n  %sTotal size: %s%s\n\n' "$C_BOLD" "$(human "$total")" "$C_RESET"
+
+    if (( ! DRY_RUN )); then
+        confirm "Proceed with cleaning the above?" || { note "Aborted."; return 0; }
+        echo
+    fi
+
+    for c in "${cats[@]}"; do
+        info "${C_BLUE}==>${C_RESET} $(category_title "$c")"
+        "${c}_clean"
+    done
+
+    echo
+    if (( DRY_RUN )); then
+        note "Dry-run complete — nothing was deleted."
+    else
+        ok "Cleaning complete."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Usage / argument parsing
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${C_BOLD}archclean${C_RESET} v${VERSION} — a safe system cleaner for Arch Linux
+
+${C_BOLD}USAGE${C_RESET}
+    $PROG <command> [categories...] [options]
+
+${C_BOLD}COMMANDS${C_RESET}
+    scan            Report reclaimable space per category (default). Deletes nothing.
+    clean           Reclaim space. Requires categories (or --all) and a confirmation.
+    help            Show this help.
+    version         Show version.
+
+${C_BOLD}CATEGORIES${C_RESET}
+    pkgcache        Pacman package cache — trimmed with paccache, keeps recent versions.
+    orphans         Orphaned packages (pacman -Qtdq) removed with pacman -Rs.
+    crash           Crash report files in /var/crash.
+    logs            systemd journal — vacuumed with journalctl (safe; never rm /var/log).
+    cache           Current user's ~/.cache contents.
+    trash           Current user's ~/.local/share/Trash (gio trash --empty).
+    claude          Old Claude Code versions (~/.local/share/claude/versions); keeps current.
+    agy             Old agy/antigravity-cli binaries (~/.local/bin/agy.*.old).
+    npm             npm download cache (~/.npm/_cacache; npm cache clean --force).
+    npx             npx package cache (~/.npm/_npx; npm cache npx rm --force).
+    bun             bun install cache (~/.bun/install/cache; bun pm cache rm -g).
+    go              Go build + module cache (go clean -cache -modcache).
+    cargo           Cargo registry cache + src (~/.cargo/registry); keeps index.
+    uv              uv cache (uv cache clean; default ~/.cache/uv).
+    coredump        systemd core dumps (/var/lib/systemd/coredump).
+    (none given to 'scan' = all categories)
+
+${C_BOLD}OPTIONS${C_RESET}
+    -a, --all              Select every category.
+    -n, --dry-run          Show exactly what would be deleted; delete nothing.
+    -y, --yes              Skip the confirmation prompt (for scripts/automation).
+    -x, --exclude GLOB     Protect files/folders from deletion (repeatable). Matches
+                           an entry's full path or its name, e.g. -x mozilla
+                           -x '*.pacnew' -x "\$HOME/.cache/keepme". Applies to the
+                           crash, cache, trash and coredump categories (trash: rm fallback only, not gio).
+    -k, --keep N           Package versions to keep in pkgcache (default: $KEEP_VERSIONS).
+        --journal-keep T   journald retention for 'logs' (default: $JOURNAL_KEEP, e.g. 10d, 500M).
+    -h, --help             Show this help.
+
+${C_BOLD}EXAMPLES${C_RESET}
+    $PROG                          # scan everything
+    $PROG scan cache trash         # scan just user caches and trash
+    $PROG clean --all --dry-run    # preview a full clean
+    $PROG clean pkgcache orphans   # trim package cache and remove orphans
+    $PROG clean cache -y           # clear ~/.cache without prompting
+
+${C_BOLD}CONFIGURATION${C_RESET}
+    Defaults can be set in a config file (parsed, never executed):
+        $SYSTEM_CONFIG            (system-wide)
+        $(user_config_path)   (per-user, overrides system)
+    Keys: keep_versions, journal_keep, exclude, assume_yes, dry_run.
+    CLI flags win over both.
+    Example:
+        keep_versions = 1
+        journal_keep  = 10d
+        exclude       = mozilla, *.pacnew
+
+${C_BOLD}SAFETY${C_RESET}
+    Nothing is ever deleted without an explicit 'clean' command and confirmation.
+    System categories use pacman/journalctl tooling that preserves what the system
+    needs; no blind deletion of /var/log or the entire package cache.
+EOF
+}
+
+main() {
+    local command=""
+    local -a positionals=()
+
+    # Config file first; CLI flags below override whatever it sets.
+    load_config
+
+    while (( $# )); do
+        case "$1" in
+            scan|clean|help|version) command="$1" ;;
+            -a|--all)       SELECTED=("${ALL_CATEGORIES[@]}") ;;
+            -n|--dry-run)   DRY_RUN=1 ;;
+            -y|--yes)       ASSUME_YES=1 ;;
+            -x|--exclude)   shift; EXCLUDES+=("${1:?--exclude needs a pattern}") ;;
+            --exclude=*)    EXCLUDES+=("${1#*=}") ;;
+            -k|--keep)      shift; KEEP_VERSIONS="${1:?--keep needs a number}" ;;
+            --keep=*)       KEEP_VERSIONS="${1#*=}" ;;
+            --journal-keep) shift; JOURNAL_KEEP="${1:?--journal-keep needs a value}" ;;
+            --journal-keep=*) JOURNAL_KEEP="${1#*=}" ;;
+            -h|--help)      usage; exit 0 ;;
+            -v|--version)   echo "archclean $VERSION"; exit 0 ;;
+            --)             shift; positionals+=("$@"); break ;;
+            -*)             die "unknown option: $1 (try --help)" ;;
+            *)              positionals+=("$1") ;;
+        esac
+        shift
+    done
+
+    # Positional args after the command are category names.
+    local p
+    for p in "${positionals[@]}"; do
+        if is_category "$p"; then
+            SELECTED+=("$p")
+        else
+            die "unknown category: '$p' (valid: ${ALL_CATEGORIES[*]})"
+        fi
+    done
+
+    # De-duplicate SELECTED while preserving canonical order.
+    if (( ${#SELECTED[@]} )); then
+        local -a ordered=() c s
+        for c in "${ALL_CATEGORIES[@]}"; do
+            for s in "${SELECTED[@]}"; do
+                [[ "$s" == "$c" ]] && { ordered+=("$c"); break; }
+            done
+        done
+        SELECTED=("${ordered[@]}")
+    fi
+
+    case "${command:-scan}" in
+        scan)    cmd_scan ;;
+        clean)   cmd_clean ;;
+        help)    usage ;;
+        version) echo "archclean $VERSION" ;;
+        *)       usage; exit 1 ;;
+    esac
+}
+
+main "$@"
