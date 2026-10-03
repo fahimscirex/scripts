@@ -101,6 +101,15 @@ load_config_file() {
                     pat="${pat#"${pat%%[![:space:]]*}"}"; pat="${pat%"${pat##*[![:space:]]}"}"
                     [[ -n "$pat" ]] && EXCLUDES+=("$pat")
                 done ;;
+            cache_allowlist)
+                # Comma-separated list; REPLACES the default allowlist.
+                CACHE_ALLOWLIST=()
+                local IFS=','
+                local entry
+                for entry in $value; do
+                    entry="${entry#"${entry%%[![:space:]]*}"}"; entry="${entry%"${entry##*[![:space:]]}"}"
+                    [[ -n "$entry" ]] && CACHE_ALLOWLIST+=("$entry")
+                done ;;
             assume_yes)    [[ "$value" =~ ^(1|true|yes)$ ]] && ASSUME_YES=1 ;;
             dry_run)       [[ "$value" =~ ^(1|true|yes)$ ]] && DRY_RUN=1 ;;
             *)             warn "$file: ignoring unknown setting '$key'" ;;
@@ -188,6 +197,18 @@ build_exclude_args() {
         [[ -n "$p" ]] || continue
         EXCLUDE_ARGS+=( ! -path "$p" ! -name "$p" )
     done
+}
+
+# True if $1 (full path) or its basename matches any EXCLUDES glob.
+is_excluded() {
+    local p base
+    base="${1##*/}"
+    for p in "${EXCLUDES[@]}"; do
+        [[ -n "$p" ]] || continue
+        case "$1" in $p) return 0 ;; esac
+        case "$base" in $p) return 0 ;; esac
+    done
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -334,13 +355,57 @@ user_home() {
 
 cache_dir() { printf '%s/.cache' "$(user_home)"; }
 
-cache_size() { size_of "$(cache_dir)"; }
+# Default set of top-level ~/.cache entries that may be cleaned: each is a
+# regenerable cache that apps rebuild on next launch. Everything else in
+# ~/.cache — live app state, sockets, locks — is left alone.
+# Overridable with `cache_allowlist` in the config file (replaces this list).
+# The magic value ALL selects the whole directory instead.
+CACHE_ALLOWLIST=(thumbnails mozilla chromium google-chrome fontconfig mesa_shader_cache pip node-gyp fish)
 
-cache_desc() {
+# True when the allowlist holds the magic ALL value (whole directory).
+cache_all_mode() {
+    local n
+    for n in "${CACHE_ALLOWLIST[@]}"; do
+        [[ "$n" == "ALL" ]] && return 0
+    done
+    return 1
+}
+
+# Existing cleanable cache dirs (honouring excludes), one per line.
+cache_allowlisted() {
     local d n
     d=$(cache_dir)
-    n=$(find "$d" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l)
-    printf 'user cache entries in %s: %s' "$d" "$n"
+    [[ -d "$d" ]] || return 0
+    if cache_all_mode; then
+        local f
+        for f in "$d"/* "$d"/.*; do
+            [[ -e "$f" ]] || continue
+            case "$f" in "$d/."|"$d/..") continue ;; esac
+            is_excluded "$f" || printf '%s\n' "$f"
+        done
+        return 0
+    fi
+    for n in "${CACHE_ALLOWLIST[@]}"; do
+        # Reject path tricks from the config file (.., /, absolute paths).
+        case "$n" in ""|*/*|.*) continue ;; esac
+        [[ -e "$d/$n" ]] || continue
+        is_excluded "$d/$n" || printf '%s\n' "$d/$n"
+    done
+}
+
+cache_size() {
+    local -a dirs; mapfile -t dirs < <(cache_allowlisted)
+    (( ${#dirs[@]} )) || { printf '0'; return; }
+    size_of "${dirs[@]}"
+}
+
+cache_desc() {
+    local -a dirs; mapfile -t dirs < <(cache_allowlisted)
+    if cache_all_mode; then
+        printf 'whole directory selected (%s entries)' "${#dirs[@]}"
+    else
+        printf 'allowlisted app caches present: %s of %s' "${#dirs[@]}" "${#CACHE_ALLOWLIST[@]}"
+    fi
 }
 
 cache_clean() {
@@ -350,14 +415,18 @@ cache_clean() {
     d=$(cache_dir)
     safe_path "$d" || die "refusing unsafe cache path"
     [[ "$d" == */.cache ]] || die "cache path sanity check failed: $d"
-    [[ -d "$d" ]] || { note "  no user cache"; return 0; }
-    # Delete the CONTENTS of ~/.cache, not the directory itself.
-    if (( DRY_RUN )); then
-        find "$d" -maxdepth 1 -mindepth 1 "${EXCLUDE_ARGS[@]}" \
-            -printf '  would delete: %p\n' 2>/dev/null || true
-    else
-        run_user find "$d" -maxdepth 1 -mindepth 1 "${EXCLUDE_ARGS[@]}" -exec rm -rf {} +
-    fi
+    local -a dirs; mapfile -t dirs < <(cache_allowlisted)
+    (( ${#dirs[@]} )) || { note "  no allowlisted caches present"; return 0; }
+    local t
+    for t in "${dirs[@]}"; do
+        case "$t" in "$d"/*) ;; *) die "cache path sanity check failed: $t" ;; esac
+        if (( DRY_RUN )); then
+            note "  would delete: $t"
+        else
+            run_user rm -rf -- "$t" \
+                || warn "could not remove $t (likely in use); re-run to retry"
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -394,7 +463,8 @@ trash_clean() {
             find "$d/$sub" -maxdepth 1 -mindepth 1 "${EXCLUDE_ARGS[@]}" \
                 -printf '  would delete: %p\n' 2>/dev/null || true
         else
-            run_user find "$d/$sub" -maxdepth 1 -mindepth 1 "${EXCLUDE_ARGS[@]}" -exec rm -rf {} +
+            run_user find "$d/$sub" -maxdepth 1 -mindepth 1 "${EXCLUDE_ARGS[@]}" -exec rm -rf {} + \
+                || warn "some trash entries were busy and skipped; re-run to retry"
         fi
     done
 }
@@ -514,7 +584,8 @@ clean_cache_contents() {
     if (( DRY_RUN )); then
         find "$d" -maxdepth 1 -mindepth 1 -printf '  would delete: %p\n' 2>/dev/null || true
     else
-        run_user find "$d" -maxdepth 1 -mindepth 1 -exec rm -rf {} +
+        run_user find "$d" -maxdepth 1 -mindepth 1 -exec rm -rf {} + \
+            || warn "some entries in $d were busy and skipped; re-run to retry"
     fi
 }
 
@@ -659,7 +730,7 @@ category_title() {
         orphans)  echo "Orphaned packages" ;;
         crash)    echo "Crash reports" ;;
         logs)     echo "System logs" ;;
-        cache)    echo "Application cache" ;;
+        cache)    echo "App caches (allowlist)" ;;
         trash)    echo "Trash" ;;
         claude)   echo "Claude Code versions" ;;
         agy)      echo "Old agy binaries" ;;
@@ -761,7 +832,7 @@ ${C_BOLD}CATEGORIES${C_RESET}
     orphans         Orphaned packages (pacman -Qtdq) removed with pacman -Rs.
     crash           Crash report files in /var/crash.
     logs            systemd journal — vacuumed with journalctl (safe; never rm /var/log).
-    cache           Current user's ~/.cache contents.
+    cache           Allowlisted regenerable app caches under ~/.cache (ALL = whole dir).
     trash           Current user's ~/.local/share/Trash (gio trash --empty).
     claude          Old Claude Code versions (~/.local/share/claude/versions); keeps current.
     agy             Old agy/antigravity-cli binaries (~/.local/bin/agy.*.old).
@@ -797,12 +868,13 @@ ${C_BOLD}CONFIGURATION${C_RESET}
     Defaults can be set in a config file (parsed, never executed):
         $SYSTEM_CONFIG            (system-wide)
         $(user_config_path)   (per-user, overrides system)
-    Keys: keep_versions, journal_keep, exclude, assume_yes, dry_run.
+    Keys: keep_versions, journal_keep, exclude, cache_allowlist, assume_yes, dry_run.
     CLI flags win over both.
     Example:
-        keep_versions = 1
-        journal_keep  = 10d
-        exclude       = mozilla, *.pacnew
+        keep_versions   = 1
+        journal_keep    = 10d
+        exclude         = mozilla, *.pacnew
+        cache_allowlist = thumbnails, fish, pip
 
 ${C_BOLD}SAFETY${C_RESET}
     Nothing is ever deleted without an explicit 'clean' command and confirmation.

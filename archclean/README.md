@@ -15,8 +15,9 @@ archclean clean cache -y         # clear ~/.cache without prompting
 Categories: `pkgcache` (trimmed with `paccache`, keeps N newest per package —
 needs `pacman-contrib`), `orphans` (removed with `pacman -Rs`, keeps user
 config files), `crash`, `coredump`, `logs` (journal vacuumed with
-`journalctl --vacuum-time`, never `rm`'d), `cache`, `trash`, `npm`, `npx`,
-`bun`, `go`, `cargo`, `uv`, plus `claude` and `agy`.
+`journalctl --vacuum-time`, never `rm`'d), `cache` (allowlist of regenerable
+app caches only — never the whole `~/.cache`),
+`trash`, `npm`, `npx`, `bun`, `go`, `cargo`, `uv`, plus `claude` and `agy`.
 
 Note: `claude` (old Claude Code versions) and `agy` (old antigravity-cli
 binaries) reflect the author's setup — they assume default install paths
@@ -33,12 +34,17 @@ Defaults can live in a config file (parsed, never executed — CLI flags win):
 - `~/.config/archclean/config` (per-user)
 
 ```ini
-keep_versions = 1
-journal_keep  = 2weeks
-exclude       = mozilla, *.pacnew
-assume_yes    = false
-dry_run       = false
+keep_versions   = 1
+journal_keep    = 2weeks
+exclude         = mozilla, *.pacnew
+cache_allowlist = thumbnails, fish, pip
+assume_yes      = false
+dry_run         = false
 ```
+
+`cache_allowlist` replaces the default `cache` allowlist (omit the key to
+keep the defaults; use `exclude` to subtract single entries instead). The
+special value `ALL` restores whole-directory cleaning.
 
 ## License
 
