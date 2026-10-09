@@ -470,10 +470,12 @@ trash_clean() {
 }
 
 # ---------------------------------------------------------------------------
-# Category: old Claude Code versions (~/.local/share/claude/versions)
-# The launcher symlink points at the active version; everything else is stale.
+# Category: old Claude Code versions. Two stores:
+#   ~/.local/share/claude/versions  — CLI; launcher symlink marks the active one.
+#   ~/.config/Claude/claude-code    — desktop app; no symlink, so keep newest.
 # ---------------------------------------------------------------------------
 claude_versions_dir() { printf '%s/.local/share/claude/versions' "$(user_home)"; }
+claude_appcode_dir()  { printf '%s/.config/Claude/claude-code' "$(user_home)"; }
 
 # Version dir name the `claude` launcher currently points at (empty if unknown).
 claude_current_version() {
@@ -484,20 +486,37 @@ claude_current_version() {
     esac
 }
 
-# Absolute paths of every version blob except the current one, one per line.
-# Each version is a single self-contained binary file; the launcher symlinks it.
+# Old version dirs in the desktop-app store — keep the highest semver, the rest
+# are stale. No symlink here, so newest-wins is the safe heuristic.
+claude_appcode_old() {
+    local dir newest d name
+    dir=$(claude_appcode_dir)
+    [[ -d "$dir" ]] || return 0
+    newest=$(ls -1 "$dir" 2>/dev/null | sort -V | tail -1)
+    [[ -n "$newest" ]] || return 0
+    for d in "$dir"/*/; do
+        [[ -d "$d" ]] || continue
+        d="${d%/}"; name="${d##*/}"
+        [[ "$name" == "$newest" ]] && continue
+        printf '%s\n' "$d"
+    done
+}
+
+# Absolute paths of every stale version across both stores, one per line.
 claude_old_versions() {
     local dir cur d name
     dir=$(claude_versions_dir)
-    [[ -d "$dir" ]] || return 0
     cur=$(claude_current_version)
-    [[ -n "$cur" ]] || return 0   # can't identify current -> refuse to list any as old
-    for d in "$dir"/*; do
-        [[ -f "$d" ]] || continue   # version blobs are files; skip locks/ etc.
-        name="${d##*/}"
-        [[ "$name" == "$cur" ]] && continue
-        printf '%s\n' "$d"
-    done
+    # CLI store: single-file blobs, symlink marks current. Skip if current unknown.
+    if [[ -d "$dir" && -n "$cur" ]]; then
+        for d in "$dir"/*; do
+            [[ -f "$d" ]] || continue   # version blobs are files; skip locks/ etc.
+            name="${d##*/}"
+            [[ "$name" == "$cur" ]] && continue
+            printf '%s\n' "$d"
+        done
+    fi
+    claude_appcode_old
 }
 
 claude_size() {
@@ -522,7 +541,7 @@ claude_clean() {
     local d
     for d in "${old[@]}"; do
         safe_path "$d" || continue
-        case "$d" in */versions/*) ;; *) continue ;; esac   # sanity guard
+        case "$d" in */versions/*|*/claude-code/*) ;; *) continue ;; esac   # sanity guard
         if (( DRY_RUN )); then
             note "  would delete: $d"
         else
